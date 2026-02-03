@@ -382,7 +382,7 @@ dns_exists() {
 }
 
 install_ssl() {
-  local domain email add_www ans
+  local domain email
   domain="$(read_tty "Domain for SSL (e.g. example.com): ")"
   domain="${domain,,}"
   [[ -n "$domain" ]] || { msg_err "Domain empty"; return; }
@@ -390,21 +390,15 @@ install_ssl() {
   email="$(read_tty "Email for Let's Encrypt: ")"
   [[ -n "$email" ]] || { msg_err "Email empty"; return; }
 
-  ans="$(read_tty "Include www.${domain}? (y/N): ")"
-  ans="${ans,,}"
-  add_www="0"
-  [[ "$ans" == "y" || "$ans" == "yes" ]] && add_www="1"
-
   apt-get update -y
   apt-get install -y certbot python3-certbot-nginx
 
   local args=(-d "$domain")
-  if [[ "$add_www" == "1" ]]; then
-    if dns_exists "www.${domain}"; then
-      args+=(-d "www.${domain}")
-    else
-      msg_warn "DNS for www.${domain} not found (NXDOMAIN). Will issue SSL for ${domain} only."
-    fi
+  if getent ahosts "www.${domain}" >/dev/null 2>&1; then
+    args+=(-d "www.${domain}")
+    msg_ok "DNS OK: www.${domain} exists -> include www"
+  else
+    msg_warn "DNS missing: www.${domain} (NXDOMAIN) -> skip www"
   fi
 
   if ! certbot --nginx "${args[@]}" -m "$email" --agree-tos --non-interactive --redirect; then
@@ -414,14 +408,12 @@ install_ssl() {
 
   systemctl enable --now certbot.timer || true
 
-  # best-effort enable HTTP/2
   sed -i 's/listen 443 ssl;/listen 443 ssl http2;/' /etc/nginx/sites-enabled/*.conf 2>/dev/null || true
   sed -i 's/listen \[::\]:443 ssl;/listen [::]:443 ssl http2;/' /etc/nginx/sites-enabled/*.conf 2>/dev/null || true
 
   nginx_reload
   msg_ok "SSL installed."
   msg_ok "Domain: https://${domain}"
-  [[ "$add_www" == "1" ]] && msg_ok "www included if DNS exists."
 }
 
 install_wpcli() {
