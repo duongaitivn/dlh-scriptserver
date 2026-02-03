@@ -202,7 +202,6 @@ gzip_types
 "limit_req_zone \$binary_remote_addr zone=perip:10m rate=5r/s;
 limit_req_zone \$binary_remote_addr zone=login:10m rate=1r/s;
 limit_conn_zone \$binary_remote_addr zone=connperip:10m;
-limit_conn_zone \$binary_remote_addr zone=connperip:10m;
 "
 
   write_file "/etc/nginx/snippets/block-sensitive.conf" \
