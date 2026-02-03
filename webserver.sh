@@ -233,8 +233,7 @@ echo \"Update done.\"
 }
 
 install_dlh_menu() {
-  cat >/usr/local/bin/dlh <<'SH'
-#!/usr/bin/env bash
+  #!/usr/bin/env bash
 set -euo pipefail
 
 CONF="/etc/dlh-menu.conf"
@@ -267,18 +266,18 @@ read_tty() {
   fi
   printf "%s" "$var"
 }
-pause() { read_tty "Press Enter to continue..."; }
+pause() { read_tty "Nhấn Enter để tiếp tục..."; }
 
 banner() {
   clear_screen
-  printf "%s%sDLH SERVER TOOLKIT%s\n" "$C_BOLD" "$C_CYA" "$C_RESET"
-  printf "%sBasic Webserver (Nginx/PHP/SSL/WP) - menu style like HOCVPS%s\n" "$C_DIM" "$C_RESET"
+  printf "%s%sDLH-Script V1%s\n" "$C_BOLD" "$C_CYA" "$C_RESET"
+  printf "%sBộ công cụ webserver cơ bản (Nginx/PHP/SSL/WordPress) - menu kiểu HOCVPS%s\n" "$C_DIM" "$C_RESET"
   hr
 }
 
 msg_ok()   { printf "%s[OK]%s %s\n"   "$C_GRN" "$C_RESET" "$*"; }
-msg_warn() { printf "%s[WARN]%s %s\n" "$C_YEL" "$C_RESET" "$*"; }
-msg_err()  { printf "%s[ERR]%s %s\n"  "$C_RED" "$C_RESET" "$*"; }
+msg_warn() { printf "%s[CẢNH BÁO]%s %s\n" "$C_YEL" "$C_RESET" "$*"; }
+msg_err()  { printf "%s[LỖI]%s %s\n"  "$C_RED" "$C_RESET" "$*"; }
 
 # auto sudo
 if [[ "${EUID}" -ne 0 ]]; then
@@ -324,9 +323,9 @@ EOF
 add_domain() {
   ensure_snippets
   local domain
-  domain="$(read_tty "Domain (e.g. example.com): ")"
+  domain="$(read_tty "Nhập tên miền (vd: example.com): ")"
   domain="${domain,,}"
-  [[ -n "$domain" ]] || { msg_err "Domain empty"; return; }
+  [[ -n "$domain" ]] || { msg_err "Tên miền trống."; return; }
 
   local webroot="${ROOT_BASE}/${domain}/public"
   mkdir -p "$webroot"
@@ -357,52 +356,49 @@ EOF
 
   ln -sf "$conf" "/etc/nginx/sites-enabled/${domain}.conf"
   nginx_reload
-  msg_ok "Added domain: ${domain}"
-  msg_ok "Webroot: ${webroot}"
-}
-
-# DNS check without extra packages:
-dns_exists() {
-  local host="$1"
-  getent ahosts "$host" >/dev/null 2>&1
+  msg_ok "Đã tạo website cho: ${domain}"
+  msg_ok "Thư mục web: ${webroot}"
 }
 
 install_ssl() {
   local domain email
-  domain="$(read_tty "Domain for SSL (e.g. example.com): ")"
+  domain="$(read_tty "Nhập tên miền để cài SSL (vd: example.com): ")"
   domain="${domain,,}"
-  [[ -n "$domain" ]] || { msg_err "Domain empty"; return; }
+  [[ -n "$domain" ]] || { msg_err "Tên miền trống."; return; }
 
-  email="$(read_tty "Email for Let's Encrypt: ")"
-  [[ -n "$email" ]] || { msg_err "Email empty"; return; }
+  email="$(read_tty "Nhập email nhận thông báo SSL: ")"
+  [[ -n "$email" ]] || { msg_err "Email trống."; return; }
 
   apt-get update -y
   apt-get install -y certbot python3-certbot-nginx
 
+  # AUTO: nếu www có DNS thì thêm, thiếu thì tự bỏ (không hỏi Y/N)
   local args=(-d "$domain")
   if getent ahosts "www.${domain}" >/dev/null 2>&1; then
     args+=(-d "www.${domain}")
-    msg_ok "DNS OK: www.${domain} exists -> include www"
+    msg_ok "DNS có www.${domain} -> sẽ xin SSL kèm www"
   else
-    msg_warn "DNS missing: www.${domain} (NXDOMAIN) -> skip www"
+    msg_warn "DNS thiếu www.${domain} (NXDOMAIN) -> bỏ www, chỉ xin SSL cho ${domain}"
   fi
 
   if ! certbot --nginx "${args[@]}" -m "$email" --agree-tos --non-interactive --redirect; then
-    msg_warn "SSL failed. Check DNS/Cloudflare and ensure port 80 reachable."
+    msg_warn "Cài SSL thất bại. Kiểm tra DNS/Cloudflare và đảm bảo port 80 truy cập được."
     return
   fi
 
   systemctl enable --now certbot.timer || true
+
+  # best-effort enable HTTP/2
   sed -i 's/listen 443 ssl;/listen 443 ssl http2;/' /etc/nginx/sites-enabled/*.conf 2>/dev/null || true
   sed -i 's/listen \[::\]:443 ssl;/listen [::]:443 ssl http2;/' /etc/nginx/sites-enabled/*.conf 2>/dev/null || true
-  nginx_reload
-  msg_ok "SSL installed: https://${domain}"
-}
 
+  nginx_reload
+  msg_ok "Đã cài SSL thành công: https://${domain}"
+}
 
 install_wpcli() {
   if command -v wp >/dev/null 2>&1; then
-    msg_ok "WP-CLI already installed: $(wp --version)"
+    msg_ok "WP-CLI đã có sẵn: $(wp --version)"
     return
   fi
   apt-get update -y
@@ -411,67 +407,67 @@ install_wpcli() {
   php /tmp/wp-cli.phar --info >/dev/null
   chmod +x /tmp/wp-cli.phar
   mv /tmp/wp-cli.phar /usr/local/bin/wp
-  msg_ok "WP-CLI installed: $(wp --version)"
+  msg_ok "Đã cài WP-CLI: $(wp --version)"
 }
 
 wp_download() {
   local domain dir
-  domain="$(read_tty "Domain (must exist in ${ROOT_BASE}/<domain>/public): ")"
+  domain="$(read_tty "Nhập tên miền (phải tồn tại trong ${ROOT_BASE}/<domain>/public): ")"
   domain="${domain,,}"
   dir="${ROOT_BASE}/${domain}/public"
-  [[ -d "$dir" ]] || { msg_err "Webroot not found: $dir (Add Domain first)"; return; }
+  [[ -d "$dir" ]] || { msg_err "Không thấy thư mục web: $dir (hãy tạo Domain trước)."; return; }
 
   install_wpcli
 
   if [[ -f "${dir}/wp-config.php" || -d "${dir}/wp-admin" ]]; then
-    msg_warn "WordPress seems already exists in $dir (skip)."
+    msg_warn "WordPress có vẻ đã tồn tại tại $dir (bỏ qua)."
     return
   fi
 
   rm -f "${dir}/index.php" 2>/dev/null || true
   chown -R www-data:www-data "$dir"
   sudo -u www-data wp core download --path="$dir" --locale=vi --skip-content
-  msg_ok "Downloaded WordPress (vi) to $dir"
+  msg_ok "Đã tải WordPress (tiếng Việt) vào: $dir"
 }
 
 wp_fixperm() {
   local domain dir
-  domain="$(read_tty "Domain: ")"
+  domain="$(read_tty "Nhập tên miền: ")"
   domain="${domain,,}"
   dir="${ROOT_BASE}/${domain}"
-  [[ -d "$dir" ]] || { msg_err "Not found: $dir"; return; }
+  [[ -d "$dir" ]] || { msg_err "Không tìm thấy: $dir"; return; }
 
   chown -R www-data:www-data "$dir"
   find "$dir" -type d -exec chmod 755 {} \;
   find "$dir" -type f -exec chmod 644 {} \;
-  msg_ok "Fixed permissions: $dir"
+  msg_ok "Đã sửa quyền (www-data) cho: $dir"
 }
 
 wp_menu() {
   while true; do
     banner
-    printf "%s%s[WORDPRESS]%s\n" "$C_BOLD" "$C_BLU" "$C_RESET"
-    echo "1) Install WP-CLI"
-    echo "2) Download WordPress (vi) to domain webroot"
-    echo "3) Fix permissions (www-data)"
-    echo "0) Back"
+    printf "%s%s[TIỆN ÍCH WORDPRESS]%s\n" "$C_BOLD" "$C_BLU" "$C_RESET"
+    echo "1) Cài WP-CLI"
+    echo "2) Tải WordPress (tiếng Việt) vào thư mục domain"
+    echo "3) Sửa quyền file/thư mục (www-data)"
+    echo "0) Quay lại"
     hr
-    case "$(read_tty "Choose: ")" in
+    case "$(read_tty "Chọn: ")" in
       1) install_wpcli; pause ;;
       2) wp_download; pause ;;
       3) wp_fixperm; pause ;;
       0) return ;;
-      *) msg_warn "Invalid"; pause ;;
+      *) msg_warn "Lựa chọn không hợp lệ."; pause ;;
     esac
   done
 }
 
 nginx_tools() {
   banner
-  echo "${C_BOLD}nginx -t${C_RESET}"
+  echo "${C_BOLD}Kiểm tra cấu hình Nginx (nginx -t)${C_RESET}"
   nginx -t || true
   echo
-  echo "${C_BOLD}status nginx/php-fpm${C_RESET}"
+  echo "${C_BOLD}Trạng thái dịch vụ (nginx/php-fpm)${C_RESET}"
   systemctl status nginx php8.3-fpm --no-pager || true
   hr
   pause
@@ -479,29 +475,29 @@ nginx_tools() {
 
 set_update_url() {
   local url
-  url="$(read_tty "Installer RAW URL (webserver.sh): ")"
+  url="$(read_tty "Nhập RAW URL của webserver.sh trên GitHub: ")"
   INSTALL_URL="$url"
   save_conf
-  msg_ok "Saved INSTALL_URL"
+  msg_ok "Đã lưu INSTALL_URL."
 }
 
 run_update() {
   if command -v webserver-update >/dev/null 2>&1; then
     webserver-update
-    msg_ok "Updated via webserver-update"
+    msg_ok "Đã cập nhật bằng webserver-update."
     return
   fi
   if [[ -z "${INSTALL_URL}" ]]; then
-    msg_err "INSTALL_URL empty. Set it first."
+    msg_err "INSTALL_URL đang trống. Hãy đặt URL trước."
     return
   fi
   curl -fsSL "$INSTALL_URL" | sudo INSTALL_URL="$INSTALL_URL" bash
-  msg_ok "Updated from $INSTALL_URL"
+  msg_ok "Đã cập nhật từ: $INSTALL_URL"
 }
 
 set_root_base() {
   local v
-  v="$(read_tty "ROOT_BASE (current: ${ROOT_BASE}): ")"
+  v="$(read_tty "Thư mục web gốc ROOT_BASE (hiện tại: ${ROOT_BASE}): ")"
   [[ -n "$v" ]] && ROOT_BASE="$v"
   save_conf
   msg_ok "ROOT_BASE=${ROOT_BASE}"
@@ -510,16 +506,16 @@ set_root_base() {
 menu_domain_ssl() {
   while true; do
     banner
-    printf "%s%s[DOMAIN / SSL]%s\n" "$C_BOLD" "$C_BLU" "$C_RESET"
-    echo "1) Add Domain (Nginx vhost + webroot)"
-    echo "2) Install SSL (Let's Encrypt + HTTP/2 + auto renew)"
-    echo "0) Back"
+    printf "%s%s[TÊN MIỀN / SSL]%s\n" "$C_BOLD" "$C_BLU" "$C_RESET"
+    echo "1) Thêm tên miền (tạo vhost Nginx + thư mục web)"
+    echo "2) Cài SSL miễn phí (Let's Encrypt + HTTP/2 + tự gia hạn)"
+    echo "0) Quay lại"
     hr
-    case "$(read_tty "Choose: ")" in
+    case "$(read_tty "Chọn: ")" in
       1) add_domain; pause ;;
       2) install_ssl; pause ;;
       0) return ;;
-      *) msg_warn "Invalid"; pause ;;
+      *) msg_warn "Lựa chọn không hợp lệ."; pause ;;
     esac
   done
 }
@@ -527,20 +523,20 @@ menu_domain_ssl() {
 menu_system() {
   while true; do
     banner
-    printf "%s%s[SYSTEM / TOOLS]%s\n" "$C_BOLD" "$C_BLU" "$C_RESET"
-    echo "1) Nginx tools (test/status)"
-    echo "2) Update installer from GitHub"
-    echo "3) Set update URL"
-    echo "4) Set ROOT_BASE"
-    echo "0) Back"
+    printf "%s%s[HỆ THỐNG / CÔNG CỤ]%s\n" "$C_BOLD" "$C_BLU" "$C_RESET"
+    echo "1) Công cụ Nginx (test/status)"
+    echo "2) Cập nhật script từ GitHub"
+    echo "3) Thiết lập URL cập nhật (INSTALL_URL)"
+    echo "4) Thiết lập thư mục web gốc (ROOT_BASE)"
+    echo "0) Quay lại"
     hr
-    case "$(read_tty "Choose: ")" in
+    case "$(read_tty "Chọn: ")" in
       1) nginx_tools ;;
       2) run_update; pause ;;
       3) set_update_url; pause ;;
       4) set_root_base; pause ;;
       0) return ;;
-      *) msg_warn "Invalid"; pause ;;
+      *) msg_warn "Lựa chọn không hợp lệ."; pause ;;
     esac
   done
 }
@@ -548,24 +544,24 @@ menu_system() {
 main_menu() {
   while true; do
     banner
-    echo "1) Domain / SSL"
-    echo "2) WordPress"
-    echo "3) System / Tools"
-    echo "0) Exit"
+    echo "1) Tên miền / SSL"
+    echo "2) Tiện ích WordPress"
+    echo "3) Hệ thống / Công cụ"
+    echo "0) Thoát"
     hr
-    case "$(read_tty "Choose: ")" in
+    case "$(read_tty "Chọn: ")" in
       1) menu_domain_ssl ;;
       2) wp_menu ;;
       3) menu_system ;;
       0) exit 0 ;;
-      *) msg_warn "Invalid"; pause ;;
+      *) msg_warn "Lựa chọn không hợp lệ."; pause ;;
     esac
   done
 }
 
 load_conf
 main_menu
-SH
+
   chmod +x /usr/local/bin/dlh
 }
 
