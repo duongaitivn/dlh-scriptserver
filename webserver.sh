@@ -271,7 +271,7 @@ pause() { read_tty "Nhấn Enter để tiếp tục..."; }
 banner() {
   clear_screen
   printf "%s%sDLH-Script V1%s\n" "$C_BOLD" "$C_CYA" "$C_RESET"
-  printf "%sBộ công cụ webserver cơ bản (Nginx/PHP/SSL/WordPress) - menu kiểu HOCVPS%s\n" "$C_DIM" "$C_RESET"
+  printf "%sBộ công cụ webserver cơ bản (Nginx/PHP/SSL/WordPress)%s\n" "$C_DIM" "$C_RESET"
   hr
 }
 
