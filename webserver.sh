@@ -50,7 +50,6 @@ INSTALL_URL=\"${INSTALL_URL}\"
 }
 
 detect_domain_from_nginx() {
-  # Try to detect from enabled sites
   local cand=""
   cand="$(grep -RhoP '^\s*server_name\s+\K[^;]+' /etc/nginx/sites-enabled 2>/dev/null | tr ' ' '\n' | grep -E '^[A-Za-z0-9.-]+$' | grep -vE '^(localhost|_)$' | head -n 1 || true)"
   if [[ -n "$cand" ]]; then
@@ -58,9 +57,7 @@ detect_domain_from_nginx() {
     return
   fi
 
-  # Fallback: hostname -f (often a domain if set)
   cand="$(hostname -f 2>/dev/null || true)"
-  cand="${cand%%.*}.${cand#*.}" 2>/dev/null || true
   if [[ -n "$cand" && "$cand" != "localhost" && ! "$(is_ipv4 "$cand")" ]]; then
     echo "$cand"
     return
@@ -140,7 +137,6 @@ ensure_nginx_php() {
   systemctl enable --now nginx
   systemctl enable --now php8.3-fpm
 
-  # PHP-FPM tuning for 1GB
   local pool="/etc/php/8.3/fpm/pool.d/www.conf"
   if [[ -f "$pool" ]]; then
     sed -i 's/^pm = .*/pm = ondemand/' "$pool" || true
@@ -149,6 +145,21 @@ ensure_nginx_php() {
     sed -i 's/^;*pm\.max_requests = .*/pm.max_requests = 300/' "$pool" || true
   fi
   systemctl restart php8.3-fpm
+}
+
+gzip_already_enabled_elsewhere() {
+  # Find "gzip on;" excluding our own file (to avoid self-detection).
+  # Return 0 if found elsewhere, 1 otherwise.
+  local hits=""
+  hits="$(grep -RIn "^\s*gzip\s\+on\s*;" /etc/nginx/nginx.conf /etc/nginx/conf.d /etc/nginx/sites-enabled 2>/dev/null \
+    | grep -v "/etc/nginx/conf.d/01-gzip.conf" || true)"
+  [[ -n "$hits" ]]
+}
+
+disable_our_gzip_conf() {
+  if [[ -f /etc/nginx/conf.d/01-gzip.conf ]]; then
+    mv /etc/nginx/conf.d/01-gzip.conf /etc/nginx/conf.d/01-gzip.conf.off
+  fi
 }
 
 write_nginx_global_conf() {
@@ -161,7 +172,13 @@ map \$http_user_agent \$bad_ua {
 }
 "
 
-  write_file "/etc/nginx/conf.d/01-gzip.conf" \
+  # ---- FIX: avoid duplicate gzip on; ----
+  # If gzip already exists in nginx.conf or other conf files, do NOT create our gzip file.
+  if gzip_already_enabled_elsewhere; then
+    echo "INFO: Detected existing 'gzip on;' in current Nginx config -> skip creating /etc/nginx/conf.d/01-gzip.conf"
+    disable_our_gzip_conf
+  else
+    write_file "/etc/nginx/conf.d/01-gzip.conf" \
 "gzip on;
 gzip_vary on;
 gzip_proxied any;
@@ -179,10 +196,12 @@ gzip_types
   font/woff
   font/woff2;
 "
+  fi
 
   write_file "/etc/nginx/conf.d/10-limit-zones.conf" \
 "limit_req_zone \$binary_remote_addr zone=perip:10m rate=5r/s;
 limit_req_zone \$binary_remote_addr zone=login:10m rate=1r/s;
+limit_conn_zone \$binary_remote_addr zone=connperip:10m;
 limit_conn_zone \$binary_remote_addr zone=connperip:10m;
 "
 
@@ -214,7 +233,6 @@ write_site_conf() {
   fi
   chown -R www-data:www-data /var/www/site
 
-  # Use detected domain if available; if empty, use "_" to avoid nginx error
   local server_name="${DOMAIN:-_}"
 
   write_file "/etc/nginx/sites-available/site" \
@@ -253,7 +271,6 @@ write_site_conf() {
 }
 
 ensure_ssl_http2_if_possible() {
-  # If DOMAIN is empty or IP, skip SSL
   if [[ -z "${DOMAIN}" ]]; then
     echo "INFO: DOMAIN not detected -> skip SSL (Let's Encrypt needs a domain)."
     return
@@ -265,7 +282,6 @@ ensure_ssl_http2_if_possible() {
 
   apt_install certbot python3-certbot-nginx
 
-  # Try to obtain cert. If DNS not ready, it will fail; we won't stop whole setup.
   set +e
   certbot --nginx \
     -d "${DOMAIN}" \
@@ -284,7 +300,6 @@ ensure_ssl_http2_if_possible() {
 
   systemctl enable --now certbot.timer || true
 
-  # Ensure HTTP/2 on 443 server block
   sed -i 's/listen 443 ssl;/listen 443 ssl http2;/' /etc/nginx/sites-enabled/site || true
   sed -i 's/listen \[::\]:443 ssl;/listen \[::\]:443 ssl http2;/' /etc/nginx/sites-enabled/site || true
 
@@ -318,10 +333,11 @@ source /etc/webserver-installer.conf || true
 if [[ -z \"\${INSTALL_URL:-}\" ]]; then
   echo \"INSTALL_URL is empty.\"
   echo \"Reinstall using:\"
-  echo \"  sudo bash -c 'INSTALL_URL=\\\"https://raw.githubusercontent.com/<user>/<repo>/main/webserver.sh\\\"; curl -fsSL \\\"\\\$INSTALL_URL\\\" | bash'\"
+  echo \"  sudo bash -c 'INSTALL_URL=\\\"https://raw.githubusercontent.com/<user>/<repo>/main/webserver.sh\\\"; curl -fsSL \\\"\\\$INSTALL_URL\\\" -o /tmp/webserver.sh && sudo bash /tmp/webserver.sh'\"
   exit 1
 fi
-curl -fsSL \"\$INSTALL_URL\" | sudo bash
+curl -fsSL \"\$INSTALL_URL\" -o /tmp/webserver.sh
+sudo bash /tmp/webserver.sh
 echo \"Update done.\"
 "
   chmod +x /usr/local/bin/webserver-update
@@ -331,14 +347,11 @@ main() {
   need_root
   load_conf_if_any
 
-  # Detect domain automatically (best effort)
   if [[ -z "${DOMAIN}" ]]; then
     DOMAIN="$(detect_domain_from_nginx || true)"
   fi
 
   ask_email_only
-
-  # Persist conf (email + detected domain + install url)
   save_conf
 
   echo "[1/6] UFW + Fail2ban + Swap"
@@ -364,13 +377,8 @@ main() {
   install_update_cmd
 
   echo "DONE ✅"
-  echo "- Nginx: systemctl status nginx --no-pager"
   echo "- Update later: sudo webserver-update"
-  if [[ -n "${DOMAIN}" && ! "$(is_ipv4 "${DOMAIN}")" ]]; then
-    echo "- If SSL ok: https://${DOMAIN}"
-  else
-    echo "- SSL skipped (no domain detected). After you configure domain in nginx, run: sudo webserver-update"
-  fi
+  echo "- Check: sudo nginx -t"
 }
 
 main
