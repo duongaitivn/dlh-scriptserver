@@ -1,30 +1,15 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# =========================================================
-# Webserver Basic (Ubuntu 24.04 / 1GB RAM friendly)
-# - Nginx + PHP-FPM
-# - Let's Encrypt + auto renew
-# - HTTP/2 + gzip + optional brotli
-# - logrotate + basic anti-bot + rate limiting
-# - No args required: interactive + remembers config
-# =========================================================
-
 CONF="/etc/webserver-installer.conf"
-DOMAIN=""
-EMAIL=""
-ENABLE_BROTLI="0"
-
-# If you install by:
-#   sudo bash -c 'INSTALL_URL="...raw.../webserver.sh"; curl -fsSL "$INSTALL_URL" | bash'
-# then INSTALL_URL will be available here.
 INSTALL_URL="${INSTALL_URL:-}"
 
+EMAIL=""
+DOMAIN=""
+ENABLE_BROTLI="0"   # default off for 1GB VPS
+
 need_root() {
-  if [[ "${EUID}" -ne 0 ]]; then
-    echo "ERROR: Please run as root (sudo)."
-    exit 1
-  fi
+  [[ "${EUID}" -eq 0 ]] || { echo "ERROR: run with sudo"; exit 1; }
 }
 
 apt_install() {
@@ -40,12 +25,16 @@ write_file() {
   printf "%s" "$content" > "$path"
 }
 
+is_ipv4() {
+  [[ "$1" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]
+}
+
 load_conf_if_any() {
   if [[ -f "$CONF" ]]; then
     # shellcheck disable=SC1090
     source "$CONF" || true
-    DOMAIN="${DOMAIN:-}"
     EMAIL="${EMAIL:-}"
+    DOMAIN="${DOMAIN:-}"
     ENABLE_BROTLI="${ENABLE_BROTLI:-0}"
     INSTALL_URL="${INSTALL_URL:-${INSTALL_URL}}"
   fi
@@ -53,46 +42,50 @@ load_conf_if_any() {
 
 save_conf() {
   write_file "$CONF" \
-"DOMAIN=\"${DOMAIN}\"
-EMAIL=\"${EMAIL}\"
+"EMAIL=\"${EMAIL}\"
+DOMAIN=\"${DOMAIN}\"
 ENABLE_BROTLI=\"${ENABLE_BROTLI}\"
 INSTALL_URL=\"${INSTALL_URL}\"
 "
 }
 
-ask_config() {
-  echo "=== Webserver basic setup ==="
-  echo "Current config:"
-  echo "  DOMAIN: ${DOMAIN:-<empty>}"
-  echo "  EMAIL : ${EMAIL:-<empty>}"
-  echo "  BROTLI: ${ENABLE_BROTLI:-0}"
-  echo
+detect_domain_from_nginx() {
+  # Try to detect from enabled sites
+  local cand=""
+  cand="$(grep -RhoP '^\s*server_name\s+\K[^;]+' /etc/nginx/sites-enabled 2>/dev/null | tr ' ' '\n' | grep -E '^[A-Za-z0-9.-]+$' | grep -vE '^(localhost|_)$' | head -n 1 || true)"
+  if [[ -n "$cand" ]]; then
+    echo "$cand"
+    return
+  fi
 
-  if [[ -n "${DOMAIN}" && -n "${EMAIL}" ]]; then
-    read -r -p "Keep current config? (Y/n): " keep || true
+  # Fallback: hostname -f (often a domain if set)
+  cand="$(hostname -f 2>/dev/null || true)"
+  cand="${cand%%.*}.${cand#*.}" 2>/dev/null || true
+  if [[ -n "$cand" && "$cand" != "localhost" && ! "$(is_ipv4 "$cand")" ]]; then
+    echo "$cand"
+    return
+  fi
+
+  echo ""
+}
+
+ask_email_only() {
+  echo "=== Webserver basic setup ==="
+
+  if [[ -n "${EMAIL}" ]]; then
+    echo "Current EMAIL: ${EMAIL}"
+    read -r -p "Keep this email? (Y/n): " keep || true
     keep="${keep:-Y}"
     if [[ "$keep" =~ ^[Yy]$ ]]; then
       return
     fi
   fi
 
-  read -r -p "Enter domain (e.g. example.com): " d
-  DOMAIN="${d:-$DOMAIN}"
-
   read -r -p "Enter email for Let's Encrypt (e.g. admin@example.com): " e
   EMAIL="${e:-$EMAIL}"
 
-  read -r -p "Enable brotli? (y/N): " b || true
-  b="${b:-N}"
-  if [[ "$b" =~ ^[Yy]$ ]]; then
-    ENABLE_BROTLI="1"
-  else
-    ENABLE_BROTLI="0"
-  fi
-
-  if [[ -z "$DOMAIN" || -z "$EMAIL" ]]; then
-    echo "ERROR: DOMAIN and EMAIL are required (used by Let's Encrypt)."
-    echo "Tip: Domain must have A record pointing to this VPS IP before SSL."
+  if [[ -z "$EMAIL" ]]; then
+    echo "ERROR: Email is required."
     exit 1
   fi
 }
@@ -101,7 +94,6 @@ ensure_ufw() {
   if ! command -v ufw >/dev/null 2>&1; then
     apt_install ufw
   fi
-
   ufw default deny incoming || true
   ufw default allow outgoing || true
   ufw allow OpenSSH || true
@@ -115,7 +107,6 @@ ensure_fail2ban() {
     apt_install fail2ban
   fi
   systemctl enable --now fail2ban
-
   if [[ ! -f /etc/fail2ban/jail.local ]]; then
     write_file "/etc/fail2ban/jail.local" \
 "[sshd]
@@ -216,32 +207,6 @@ location = /wp-login.php {
 "
 }
 
-enable_brotli() {
-  if [[ "${ENABLE_BROTLI}" != "1" ]]; then
-    rm -f /etc/nginx/conf.d/02-brotli.conf || true
-    return
-  fi
-
-  apt_install libnginx-mod-brotli || true
-  if ls /etc/nginx/modules-enabled/*brotli*.conf >/dev/null 2>&1; then
-    write_file "/etc/nginx/conf.d/02-brotli.conf" \
-"brotli on;
-brotli_comp_level 5;
-brotli_types
-  text/plain
-  text/css
-  application/json
-  application/javascript
-  application/xml
-  image/svg+xml
-  font/ttf
-  font/otf
-  font/woff
-  font/woff2;
-"
-  fi
-}
-
 write_site_conf() {
   mkdir -p /var/www/site/public
   if [[ ! -f /var/www/site/public/index.php ]]; then
@@ -249,12 +214,15 @@ write_site_conf() {
   fi
   chown -R www-data:www-data /var/www/site
 
+  # Use detected domain if available; if empty, use "_" to avoid nginx error
+  local server_name="${DOMAIN:-_}"
+
   write_file "/etc/nginx/sites-available/site" \
 "server {
-  listen 80;
-  listen [::]:80;
+  listen 80 default_server;
+  listen [::]:80 default_server;
 
-  server_name ${DOMAIN};
+  server_name ${server_name};
 
   root /var/www/site/public;
   index index.php index.html;
@@ -284,19 +252,39 @@ write_site_conf() {
   systemctl reload nginx
 }
 
-ensure_ssl_http2() {
+ensure_ssl_http2_if_possible() {
+  # If DOMAIN is empty or IP, skip SSL
+  if [[ -z "${DOMAIN}" ]]; then
+    echo "INFO: DOMAIN not detected -> skip SSL (Let's Encrypt needs a domain)."
+    return
+  fi
+  if is_ipv4 "${DOMAIN}"; then
+    echo "INFO: DOMAIN is an IP (${DOMAIN}) -> skip SSL (Let's Encrypt doesn't issue for IP)."
+    return
+  fi
+
   apt_install certbot python3-certbot-nginx
 
+  # Try to obtain cert. If DNS not ready, it will fail; we won't stop whole setup.
+  set +e
   certbot --nginx \
     -d "${DOMAIN}" \
     -m "${EMAIL}" \
     --agree-tos \
     --non-interactive \
     --redirect
+  local rc=$?
+  set -e
+
+  if [[ $rc -ne 0 ]]; then
+    echo "WARN: SSL request failed (maybe DNS not pointed yet)."
+    echo "      After DNS is ready, re-run: sudo webserver-update"
+    return
+  fi
 
   systemctl enable --now certbot.timer || true
 
-  # Ensure HTTP/2 on the 443 server block
+  # Ensure HTTP/2 on 443 server block
   sed -i 's/listen 443 ssl;/listen 443 ssl http2;/' /etc/nginx/sites-enabled/site || true
   sed -i 's/listen \[::\]:443 ssl;/listen \[::\]:443 ssl http2;/' /etc/nginx/sites-enabled/site || true
 
@@ -323,7 +311,6 @@ ensure_logrotate_nginx() {
 }
 
 install_update_cmd() {
-  # Create updater command that re-runs installer from INSTALL_URL (stored in conf)
   write_file "/usr/local/bin/webserver-update" \
 "#!/usr/bin/env bash
 set -euo pipefail
@@ -343,40 +330,47 @@ echo \"Update done.\"
 main() {
   need_root
   load_conf_if_any
-  ask_config
 
-  # Persist conf (also ensures INSTALL_URL is saved if provided)
+  # Detect domain automatically (best effort)
+  if [[ -z "${DOMAIN}" ]]; then
+    DOMAIN="$(detect_domain_from_nginx || true)"
+  fi
+
+  ask_email_only
+
+  # Persist conf (email + detected domain + install url)
   save_conf
 
-  echo "[1/7] UFW + Fail2ban + Swap"
+  echo "[1/6] UFW + Fail2ban + Swap"
   apt_install software-properties-common
   ensure_ufw
   ensure_fail2ban
   ensure_swap_2g
 
-  echo "[2/7] Nginx + PHP"
+  echo "[2/6] Nginx + PHP"
   ensure_nginx_php
 
-  echo "[3/7] Nginx global configs (gzip/limits/security)"
+  echo "[3/6] Nginx global configs (gzip/limits/security)"
   write_nginx_global_conf
 
-  echo "[4/7] Optional brotli"
-  enable_brotli
-
-  echo "[5/7] Site config"
+  echo "[4/6] Site config"
   write_site_conf
 
-  echo "[6/7] SSL + HTTP/2 + auto renew"
-  ensure_ssl_http2
+  echo "[5/6] SSL + HTTP/2 (auto if domain detected)"
+  ensure_ssl_http2_if_possible
 
-  echo "[7/7] Logrotate + update command"
+  echo "[6/6] Logrotate + update command"
   ensure_logrotate_nginx
   install_update_cmd
 
   echo "DONE ✅"
-  echo "- URL: https://${DOMAIN}"
+  echo "- Nginx: systemctl status nginx --no-pager"
   echo "- Update later: sudo webserver-update"
-  echo "- Certbot timer: systemctl status certbot.timer"
+  if [[ -n "${DOMAIN}" && ! "$(is_ipv4 "${DOMAIN}")" ]]; then
+    echo "- If SSL ok: https://${DOMAIN}"
+  else
+    echo "- SSL skipped (no domain detected). After you configure domain in nginx, run: sudo webserver-update"
+  fi
 }
 
 main
