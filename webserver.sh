@@ -4,10 +4,9 @@ set -euo pipefail
 CONF="/etc/webserver-installer.conf"
 INSTALL_URL="${INSTALL_URL:-}"
 
-EMAIL=""
-DOMAIN=""
-ENABLE_BROTLI="0"   # default OFF for 1GB VPS
-ZONE_CONN="dlh_connperip"  # avoid conflicts with existing configs
+# Default: no domain, no SSL in install step
+ENABLE_BROTLI="0"          # OFF for 1GB VPS
+ZONE_CONN="dlh_connperip"  # unique zone name (avoid conflicts)
 
 need_root() {
   [[ "${EUID}" -eq 0 ]] || { echo "ERROR: run with sudo"; exit 1; }
@@ -21,58 +20,12 @@ apt_install() {
 
 write_file() {
   local path="$1"
-  local content="$2"
+  local content donedir
   mkdir -p "$(dirname "$path")"
   printf "%s" "$content" > "$path"
 }
 
-is_ipv4() {
-  [[ "$1" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]
-}
-
-load_conf_if_any() {
-  if [[ -f "$CONF" ]]; then
-    # shellcheck disable=SC1090
-    source "$CONF" || true
-    EMAIL="${EMAIL:-}"
-    DOMAIN="${DOMAIN:-}"
-    ENABLE_BROTLI="${ENABLE_BROTLI:-0}"
-    INSTALL_URL="${INSTALL_URL:-${INSTALL_URL}}"
-  fi
-}
-
-save_conf() {
-  write_file "$CONF" \
-"EMAIL=\"${EMAIL}\"
-DOMAIN=\"${DOMAIN}\"
-ENABLE_BROTLI=\"${ENABLE_BROTLI}\"
-INSTALL_URL=\"${INSTALL_URL}\"
-"
-}
-
-detect_domain_from_nginx() {
-  local cand=""
-  cand="$(grep -RhoP '^\s*server_name\s+\K[^;]+' /etc/nginx/sites-enabled 2>/dev/null \
-    | tr ' ' '\n' \
-    | grep -E '^[A-Za-z0-9.-]+$' \
-    | grep -vE '^(localhost|_)$' \
-    | head -n 1 || true)"
-  if [[ -n "$cand" ]]; then
-    echo "$cand"
-    return
-  fi
-
-  cand="$(hostname -f 2>/dev/null || true)"
-  if [[ -n "$cand" && "$cand" != "localhost" && ! "$(is_ipv4 "$cand")" ]]; then
-    echo "$cand"
-    return
-  fi
-
-  echo ""
-}
-
 read_tty() {
-  # read from terminal even if script is piped (curl | bash)
   local prompt="$1"
   local var=""
   if [[ -r /dev/tty ]]; then
@@ -83,27 +36,20 @@ read_tty() {
   printf "%s" "$var"
 }
 
-ask_email_only() {
-  echo "=== Webserver basic setup ==="
-
-  if [[ -n "${EMAIL}" ]]; then
-    echo "Current EMAIL: ${EMAIL}"
-    local keep
-    keep="$(read_tty "Keep this email? (Y/n): ")"
-    keep="${keep:-Y}"
-    if [[ "$keep" =~ ^[Yy]$ ]]; then
-      return
-    fi
+load_conf_if_any() {
+  if [[ -f "$CONF" ]]; then
+    # shellcheck disable=SC1090
+    source "$CONF" || true
+    ENABLE_BROTLI="${ENABLE_BROTLI:-0}"
+    INSTALL_URL="${INSTALL_URL:-${INSTALL_URL}}"
   fi
+}
 
-  local e
-  e="$(read_tty "Enter email for Let's Encrypt (e.g. admin@example.com): ")"
-  EMAIL="${e:-$EMAIL}"
-
-  if [[ -z "$EMAIL" ]]; then
-    echo "ERROR: Email is required."
-    exit 1
-  fi
+save_conf() {
+  write_file "$CONF" \
+"ENABLE_BROTLI=\"${ENABLE_BROTLI}\"
+INSTALL_URL=\"${INSTALL_URL}\"
+"
 }
 
 ensure_ufw() {
@@ -170,7 +116,6 @@ ensure_nginx_php() {
 }
 
 gzip_already_enabled_elsewhere() {
-  # detect gzip on; outside our file
   local hits=""
   hits="$(grep -RIn "^\s*gzip\s\+on\s*;" /etc/nginx/nginx.conf /etc/nginx/conf.d /etc/nginx/sites-enabled 2>/dev/null \
     | grep -v "/etc/nginx/conf.d/01-gzip.conf" || true)"
@@ -184,7 +129,6 @@ disable_our_gzip_conf() {
 }
 
 ensure_limit_zones_unique() {
-  # Always overwrite with our desired zones to avoid duplicates
   write_file "/etc/nginx/conf.d/10-limit-zones.conf" \
 "limit_req_zone \$binary_remote_addr zone=perip:10m rate=5r/s;
 limit_req_zone \$binary_remote_addr zone=login:10m rate=1r/s;
@@ -202,9 +146,8 @@ map \$http_user_agent \$bad_ua {
 }
 "
 
-  # gzip: only create if not already enabled elsewhere
   if gzip_already_enabled_elsewhere; then
-    echo "INFO: Detected existing 'gzip on;' in current Nginx config -> skip creating /etc/nginx/conf.d/01-gzip.conf"
+    echo "INFO: Existing gzip detected -> skip creating /etc/nginx/conf.d/01-gzip.conf"
     disable_our_gzip_conf
   else
     write_file "/etc/nginx/conf.d/01-gzip.conf" \
@@ -238,11 +181,9 @@ location ~* /(composer\\.(json|lock)|package\\.json|yarn\\.lock) { deny all; }
   write_file "/etc/nginx/snippets/basic-antibot.conf" \
 "if (\$bad_ua) { return 444; }
 
-# Mild global limiting (safe for 1GB)
 limit_conn ${ZONE_CONN} 20;
 limit_req zone=perip burst=20 nodelay;
 
-# Common abuse endpoints (WP)
 location = /xmlrpc.php { deny all; }
 
 location = /wp-login.php {
@@ -259,14 +200,13 @@ write_site_conf() {
   fi
   chown -R www-data:www-data /var/www/site
 
-  local server_name="${DOMAIN:-_}"
-
+  # No domain needed: server_name _;
   write_file "/etc/nginx/sites-available/site" \
 "server {
   listen 80 default_server;
   listen [::]:80 default_server;
 
-  server_name ${server_name};
+  server_name _;
 
   root /var/www/site/public;
   index index.php index.html;
@@ -296,43 +236,6 @@ write_site_conf() {
   systemctl reload nginx
 }
 
-ensure_ssl_http2_if_possible() {
-  if [[ -z "${DOMAIN}" ]]; then
-    echo "INFO: DOMAIN not detected -> skip SSL (Let's Encrypt needs a domain)."
-    return
-  fi
-  if is_ipv4 "${DOMAIN}"; then
-    echo "INFO: DOMAIN is an IP (${DOMAIN}) -> skip SSL (Let's Encrypt doesn't issue for IP)."
-    return
-  fi
-
-  apt_install certbot python3-certbot-nginx
-
-  set +e
-  certbot --nginx \
-    -d "${DOMAIN}" \
-    -m "${EMAIL}" \
-    --agree-tos \
-    --non-interactive \
-    --redirect
-  local rc=$?
-  set -e
-
-  if [[ $rc -ne 0 ]]; then
-    echo "WARN: SSL request failed (maybe DNS not pointed yet)."
-    echo "      After DNS is ready, re-run: sudo webserver-update"
-    return
-  fi
-
-  systemctl enable --now certbot.timer || true
-
-  sed -i 's/listen 443 ssl;/listen 443 ssl http2;/' /etc/nginx/sites-enabled/site || true
-  sed -i 's/listen \[::\]:443 ssl;/listen \[::\]:443 ssl http2;/' /etc/nginx/sites-enabled/site || true
-
-  nginx -t
-  systemctl reload nginx
-}
-
 ensure_logrotate_nginx() {
   write_file "/etc/logrotate.d/nginx-custom" \
 "/var/log/nginx/*.log {
@@ -351,6 +254,54 @@ ensure_logrotate_nginx() {
 "
 }
 
+install_ssl_cmd() {
+  # Separate SSL command (only run when you actually have a domain)
+  write_file "/usr/local/bin/webserver-ssl" \
+"#!/usr/bin/env bash
+set -euo pipefail
+
+read_tty() {
+  local prompt=\"\$1\"
+  local var=\"\"
+  if [[ -r /dev/tty ]]; then
+    IFS= read -r -p \"\$prompt\" var </dev/tty || true
+  else
+    IFS= read -r -p \"\$prompt\" var || true
+  fi
+  printf \"%s\" \"\$var\"
+}
+
+DOMAIN=\"\${1:-}\"
+EMAIL=\"\${2:-}\"
+
+if [[ -z \"\$DOMAIN\" ]]; then
+  DOMAIN=\"\$(read_tty 'Enter domain to issue SSL (e.g. example.com): ')\"
+fi
+if [[ -z \"\$EMAIL\" ]]; then
+  EMAIL=\"\$(read_tty 'Enter email for Let\\x27s Encrypt (e.g. admin@example.com): ')\"
+fi
+
+if [[ -z \"\$DOMAIN\" || -z \"\$EMAIL\" ]]; then
+  echo \"ERROR: domain + email are required for SSL\"
+  exit 1
+fi
+
+sudo apt-get update -y
+sudo apt-get install -y certbot python3-certbot-nginx
+
+sudo certbot --nginx -d \"\$DOMAIN\" -m \"\$EMAIL\" --agree-tos --non-interactive --redirect
+sudo systemctl enable --now certbot.timer || true
+
+# Ensure HTTP/2 on 443 blocks (best effort)
+sudo sed -i 's/listen 443 ssl;/listen 443 ssl http2;/' /etc/nginx/sites-enabled/site || true
+sudo sed -i 's/listen \\[::\\]:443 ssl;/listen [::]:443 ssl http2;/' /etc/nginx/sites-enabled/site || true
+
+sudo nginx -t && sudo systemctl reload nginx
+echo \"SSL OK: https://\$DOMAIN\"
+"
+  chmod +x /usr/local/bin/webserver-ssl
+}
+
 install_update_cmd() {
   write_file "/usr/local/bin/webserver-update" \
 "#!/usr/bin/env bash
@@ -358,8 +309,6 @@ set -euo pipefail
 source /etc/webserver-installer.conf || true
 if [[ -z \"\${INSTALL_URL:-}\" ]]; then
   echo \"INSTALL_URL is empty.\"
-  echo \"Run installer with:\"
-  echo \"  curl -fsSL https://raw.githubusercontent.com/<user>/<repo>/main/webserver.sh | sudo INSTALL_URL=... bash\"
   exit 1
 fi
 curl -fsSL \"\$INSTALL_URL\" | sudo INSTALL_URL=\"\$INSTALL_URL\" bash
@@ -371,41 +320,32 @@ echo \"Update done.\"
 main() {
   need_root
   load_conf_if_any
-
-  if [[ -z "${DOMAIN}" ]]; then
-    DOMAIN="$(detect_domain_from_nginx || true)"
-  fi
-
-  ask_email_only
-
-  # Persist config (including INSTALL_URL if provided)
   save_conf
 
-  echo "[1/6] UFW + Fail2ban + Swap"
+  echo "[1/5] UFW + Fail2ban + Swap"
   apt_install software-properties-common
   ensure_ufw
   ensure_fail2ban
   ensure_swap_2g
 
-  echo "[2/6] Nginx + PHP"
+  echo "[2/5] Nginx + PHP"
   ensure_nginx_php
 
-  echo "[3/6] Nginx global configs (gzip/limits/security)"
+  echo "[3/5] Nginx global configs (gzip/limits/security)"
   write_nginx_global_conf
 
-  echo "[4/6] Site config"
+  echo "[4/5] Site config (no domain)"
   write_site_conf
 
-  echo "[5/6] SSL + HTTP/2 (auto if domain detected)"
-  ensure_ssl_http2_if_possible
-
-  echo "[6/6] Logrotate + update command"
+  echo "[5/5] Logrotate + commands"
   ensure_logrotate_nginx
+  install_ssl_cmd
   install_update_cmd
 
   echo "DONE ✅"
+  echo "- Test local: curl -I http://127.0.0.1"
+  echo "- SSL later (when you have domain): sudo webserver-ssl"
   echo "- Update later: sudo webserver-update"
-  echo "- Check config: sudo nginx -t"
 }
 
 main
