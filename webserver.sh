@@ -5,24 +5,21 @@ set -euo pipefail
 # DLH Webserver Basic Installer (Ubuntu 24.04 / 1GB RAM)
 # - Nginx + PHP-FPM
 # - UFW + Fail2ban + Swap
-# - gzip (skip if already enabled) + anti-bot + rate-limit (zones)
+# - gzip (skip if already enabled) + anti-bot + rate-limit zones
 # - logrotate
-# - NO domain auto-detect, NO SSL auto (domain empty is OK)
-# - Installs "dlh" menu like HOCVPS
+# - NO domain auto-detect, NO SSL auto
+# - Installs "dlh" menu (HOCVPS-like UI)
 # - Installs "webserver-update" to self-update from GitHub raw URL
 #
-# Run (recommended):
-#   curl -fsSL <RAW_URL>/webserver.sh | sudo INSTALL_URL="<RAW_URL>/webserver.sh" bash
+# Run:
+#   curl -fsSL <RAW>/webserver.sh | sudo INSTALL_URL="<RAW>/webserver.sh" bash
 # =========================================================
 
 CONF="/etc/webserver-installer.conf"
 INSTALL_URL="${INSTALL_URL:-}"
+ZONE_CONN="dlh_connperip"
 
-ZONE_CONN="dlh_connperip"  # unique to avoid conflicts
-
-need_root() {
-  [[ "${EUID}" -eq 0 ]] || { echo "ERROR: run with sudo"; exit 1; }
-}
+need_root() { [[ "${EUID}" -eq 0 ]] || { echo "ERROR: run with sudo"; exit 1; }; }
 
 apt_install() {
   export DEBIAN_FRONTEND=noninteractive
@@ -31,8 +28,7 @@ apt_install() {
 }
 
 write_file() {
-  local path="$1"
-  local content="$2"
+  local path="$1" content="$2"
   mkdir -p "$(dirname "$path")"
   printf "%s" "$content" > "$path"
 }
@@ -44,13 +40,8 @@ ZONE_CONN=\"${ZONE_CONN}\"
 "
 }
 
-# ---------------------------
-# Base security & stability
-# ---------------------------
 ensure_ufw() {
-  if ! command -v ufw >/dev/null 2>&1; then
-    apt_install ufw
-  fi
+  command -v ufw >/dev/null 2>&1 || apt_install ufw
   ufw default deny incoming || true
   ufw default allow outgoing || true
   ufw allow OpenSSH || true
@@ -60,9 +51,7 @@ ensure_ufw() {
 }
 
 ensure_fail2ban() {
-  if ! command -v fail2ban-client >/dev/null 2>&1; then
-    apt_install fail2ban
-  fi
+  command -v fail2ban-client >/dev/null 2>&1 || apt_install fail2ban
   systemctl enable --now fail2ban
 
   if [[ ! -f /etc/fail2ban/jail.local ]]; then
@@ -78,9 +67,7 @@ bantime = 2h
 }
 
 ensure_swap_2g() {
-  if swapon --show | grep -q '^/'; then
-    return
-  fi
+  swapon --show | grep -q '^/' && return
   fallocate -l 2G /swapfile
   chmod 600 /swapfile
   mkswap /swapfile
@@ -91,17 +78,12 @@ ensure_swap_2g() {
   sysctl -p /etc/sysctl.d/99-swappiness.conf >/dev/null || true
 }
 
-# ---------------------------
-# Nginx + PHP
-# ---------------------------
 ensure_nginx_php() {
   apt_install nginx
   apt_install php-fpm php-cli php-mysql php-curl php-mbstring php-xml php-zip php-gd php-intl
-
   systemctl enable --now nginx
   systemctl enable --now php8.3-fpm
 
-  # PHP-FPM tuning for 1GB
   local pool="/etc/php/8.3/fpm/pool.d/www.conf"
   if [[ -f "$pool" ]]; then
     sed -i 's/^pm = .*/pm = ondemand/' "$pool" || true
@@ -120,13 +102,10 @@ gzip_already_enabled_elsewhere() {
 }
 
 disable_our_gzip_conf() {
-  if [[ -f /etc/nginx/conf.d/01-gzip.conf ]]; then
-    mv /etc/nginx/conf.d/01-gzip.conf /etc/nginx/conf.d/01-gzip.conf.off
-  fi
+  [[ -f /etc/nginx/conf.d/01-gzip.conf ]] && mv /etc/nginx/conf.d/01-gzip.conf /etc/nginx/conf.d/01-gzip.conf.off
 }
 
 ensure_limit_zones() {
-  # Always overwrite our zones to avoid duplicates.
   write_file "/etc/nginx/conf.d/10-limit-zones.conf" \
 "limit_req_zone \$binary_remote_addr zone=perip:10m rate=5r/s;
 limit_req_zone \$binary_remote_addr zone=login:10m rate=1r/s;
@@ -169,7 +148,6 @@ gzip_types
   fi
 
   ensure_limit_zones
-
   mkdir -p /etc/nginx/snippets
 
   write_file "/etc/nginx/snippets/block-sensitive.conf" \
@@ -181,11 +159,9 @@ location ~* /(composer\\.(json|lock)|package\\.json|yarn\\.lock) { deny all; }
   write_file "/etc/nginx/snippets/basic-antibot.conf" \
 "if (\$bad_ua) { return 444; }
 
-# Mild global limiting (safe defaults for 1GB)
 limit_conn ${ZONE_CONN} 20;
 limit_req zone=perip burst=20 nodelay;
 
-# Common abuse endpoints (WP)
 location = /xmlrpc.php { deny all; }
 
 location = /wp-login.php {
@@ -196,29 +172,22 @@ location = /wp-login.php {
 }
 
 write_default_site_conf() {
-  # Default catch-all site with NO domain
   mkdir -p /var/www/site/public
-  if [[ ! -f /var/www/site/public/index.php ]]; then
-    write_file "/var/www/site/public/index.php" "<?php echo 'OK';"
-  fi
+  [[ -f /var/www/site/public/index.php ]] || write_file "/var/www/site/public/index.php" "<?php echo 'OK';"
   chown -R www-data:www-data /var/www/site
 
   write_file "/etc/nginx/sites-available/site" \
 "server {
   listen 80 default_server;
   listen [::]:80 default_server;
-
   server_name _;
-
   root /var/www/site/public;
   index index.php index.html;
 
   include /etc/nginx/snippets/block-sensitive.conf;
   include /etc/nginx/snippets/basic-antibot.conf;
 
-  location / {
-    try_files \$uri \$uri/ /index.php?\$args;
-  }
+  location / { try_files \$uri \$uri/ /index.php?\$args; }
 
   location ~ \\.php\$ {
     include snippets/fastcgi-php.conf;
@@ -233,7 +202,6 @@ write_default_site_conf() {
 "
   rm -f /etc/nginx/sites-enabled/default || true
   ln -sf /etc/nginx/sites-available/site /etc/nginx/sites-enabled/site
-
   nginx -t
   systemctl reload nginx
 }
@@ -256,9 +224,23 @@ ensure_logrotate_nginx() {
 "
 }
 
-# ---------------------------
-# DLH Menu (hocvps-like)
-# ---------------------------
+install_update_cmd() {
+  write_file "/usr/local/bin/webserver-update" \
+"#!/usr/bin/env bash
+set -euo pipefail
+source /etc/webserver-installer.conf || true
+if [[ -z \"\${INSTALL_URL:-}\" ]]; then
+  echo \"INSTALL_URL is empty.\"
+  echo \"Run once with:\"
+  echo \"  curl -fsSL <raw>/webserver.sh | sudo INSTALL_URL='<raw>/webserver.sh' bash\"
+  exit 1
+fi
+curl -fsSL \"\$INSTALL_URL\" | sudo INSTALL_URL=\"\$INSTALL_URL\" bash
+echo \"Update done.\"
+"
+  chmod +x /usr/local/bin/webserver-update
+}
+
 install_dlh_menu() {
   cat >/usr/local/bin/dlh <<'SH'
 #!/usr/bin/env bash
@@ -268,9 +250,28 @@ CONF="/etc/dlh-menu.conf"
 ROOT_BASE_DEFAULT="/var/www"
 PHP_SOCK="/run/php/php8.3-fpm.sock"
 
+# ---------- UI ----------
+is_tty() { [[ -t 1 ]]; }
+if is_tty; then
+  C_RESET=$'\033[0m'
+  C_BOLD=$'\033[1m'
+  C_DIM=$'\033[2m'
+  C_RED=$'\033[31m'
+  C_GRN=$'\033[32m'
+  C_YEL=$'\033[33m'
+  C_BLU=$'\033[34m'
+  C_CYA=$'\033[36m'
+else
+  C_RESET=""; C_BOLD=""; C_DIM=""; C_RED=""; C_GRN=""; C_YEL=""; C_BLU=""; C_CYA=""
+fi
+
+hr() { printf "%s\n" "------------------------------------------------------------"; }
+pause() { read_tty "Press Enter to continue..."; }
+
+clear_screen() { is_tty && clear || true; }
+
 read_tty() {
-  local prompt="$1"
-  local var=""
+  local prompt="$1" var=""
   if [[ -r /dev/tty ]]; then
     IFS= read -r -p "$prompt" var </dev/tty || true
   else
@@ -279,7 +280,14 @@ read_tty() {
   printf "%s" "$var"
 }
 
-# allow running just "dlh" (auto sudo)
+banner() {
+  clear_screen
+  printf "%s%sDLH SERVER TOOLKIT%s\n" "$C_BOLD" "$C_CYA" "$C_RESET"
+  printf "%sBasic Webserver (Nginx/PHP/SSL/WP) - menu style like HOCVPS%s\n" "$C_DIM" "$C_RESET"
+  hr
+}
+
+# auto sudo
 if [[ "${EUID}" -ne 0 ]]; then
   exec sudo -E "$0" "$@"
 fi
@@ -302,9 +310,7 @@ ZONE_CONN="${ZONE_CONN}"
 EOF
 }
 
-nginx_reload() {
-  nginx -t && systemctl reload nginx
-}
+nginx_reload() { nginx -t && systemctl reload nginx; }
 
 ensure_snippets() {
   mkdir -p /etc/nginx/snippets
@@ -321,13 +327,17 @@ location = /wp-login.php { try_files \$uri \$uri/ /index.php?\$args; }
 EOF
 }
 
+msg_ok() { printf "%s[OK]%s %s\n" "$C_GRN" "$C_RESET" "$*"; }
+msg_warn() { printf "%s[WARN]%s %s\n" "$C_YEL" "$C_RESET" "$*"; }
+msg_err() { printf "%s[ERR]%s %s\n" "$C_RED" "$C_RESET" "$*"; }
+
+# ---------- Actions ----------
 add_domain() {
   ensure_snippets
-
   local domain
   domain="$(read_tty "Domain (e.g. example.com): ")"
   domain="${domain,,}"
-  [[ -n "$domain" ]] || { echo "ERROR: domain empty"; return; }
+  [[ -n "$domain" ]] || { msg_err "Domain empty"; return; }
 
   local webroot="${ROOT_BASE}/${domain}/public"
   mkdir -p "$webroot"
@@ -339,7 +349,6 @@ add_domain() {
 server {
   listen 80;
   listen [::]:80;
-
   server_name ${domain} www.${domain};
 
   root ${webroot};
@@ -359,40 +368,37 @@ EOF
 
   ln -sf "$conf" "/etc/nginx/sites-enabled/${domain}.conf"
   nginx_reload
-  echo "OK: Added domain ${domain}"
-  echo "Webroot: ${webroot}"
+  msg_ok "Added domain: ${domain}"
+  msg_ok "Webroot: ${webroot}"
 }
 
 install_ssl() {
   local domain email
-  domain="$(read_tty "Domain for SSL (e.g. example.com): ")"
+  domain="$(read_tty "Domain for SSL: ")"
   domain="${domain,,}"
-  [[ -n "$domain" ]] || { echo "ERROR: domain empty"; return; }
+  [[ -n "$domain" ]] || { msg_err "Domain empty"; return; }
 
   email="$(read_tty "Email for Let's Encrypt: ")"
-  [[ -n "$email" ]] || { echo "ERROR: email empty"; return; }
+  [[ -n "$email" ]] || { msg_err "Email empty"; return; }
 
   apt-get update -y
   apt-get install -y certbot python3-certbot-nginx
 
-  certbot --nginx -d "$domain" -d "www.$domain" -m "$email" --agree-tos --non-interactive --redirect || {
-    echo "SSL failed. Check DNS/Cloudflare and ensure port 80 reachable."
+  if ! certbot --nginx -d "$domain" -d "www.$domain" -m "$email" --agree-tos --non-interactive --redirect; then
+    msg_warn "SSL failed. If using Cloudflare, try DNS-only temporarily, ensure port 80 reachable."
     return
-  }
+  fi
 
   systemctl enable --now certbot.timer || true
-
-  # best-effort enable HTTP/2
   sed -i 's/listen 443 ssl;/listen 443 ssl http2;/' /etc/nginx/sites-enabled/*.conf 2>/dev/null || true
   sed -i 's/listen \[::\]:443 ssl;/listen [::]:443 ssl http2;/' /etc/nginx/sites-enabled/*.conf 2>/dev/null || true
-
   nginx_reload
-  echo "OK: SSL installed for https://${domain}"
+  msg_ok "SSL installed: https://${domain}"
 }
 
 install_wpcli() {
   if command -v wp >/dev/null 2>&1; then
-    echo "WP-CLI already installed: $(wp --version)"
+    msg_ok "WP-CLI already installed: $(wp --version)"
     return
   fi
   apt-get update -y
@@ -401,7 +407,7 @@ install_wpcli() {
   php /tmp/wp-cli.phar --info >/dev/null
   chmod +x /tmp/wp-cli.phar
   mv /tmp/wp-cli.phar /usr/local/bin/wp
-  echo "OK: WP-CLI installed: $(wp --version)"
+  msg_ok "WP-CLI installed: $(wp --version)"
 }
 
 wp_download() {
@@ -409,23 +415,19 @@ wp_download() {
   domain="$(read_tty "Domain (must exist in ${ROOT_BASE}/<domain>/public): ")"
   domain="${domain,,}"
   dir="${ROOT_BASE}/${domain}/public"
-  if [[ ! -d "$dir" ]]; then
-    echo "ERROR: webroot not found: $dir"
-    echo "Tip: use 1) Add Domain first."
-    return
-  fi
+  [[ -d "$dir" ]] || { msg_err "Webroot not found: $dir (Add Domain first)"; return; }
 
   install_wpcli
 
   if [[ -f "${dir}/wp-config.php" || -d "${dir}/wp-admin" ]]; then
-    echo "Looks like WordPress already exists in $dir (skip)."
+    msg_warn "WordPress seems already exists in $dir (skip)."
     return
   fi
 
   rm -f "${dir}/index.php" 2>/dev/null || true
   chown -R www-data:www-data "$dir"
   sudo -u www-data wp core download --path="$dir" --locale=vi --skip-content
-  echo "OK: Downloaded WordPress to $dir"
+  msg_ok "Downloaded WordPress (vi) to $dir"
 }
 
 wp_fixperm() {
@@ -433,43 +435,45 @@ wp_fixperm() {
   domain="$(read_tty "Domain: ")"
   domain="${domain,,}"
   dir="${ROOT_BASE}/${domain}"
-  if [[ ! -d "$dir" ]]; then
-    echo "ERROR: not found: $dir"
-    return
-  fi
+  [[ -d "$dir" ]] || { msg_err "Not found: $dir"; return; }
+
   chown -R www-data:www-data "$dir"
   find "$dir" -type d -exec chmod 755 {} \;
   find "$dir" -type f -exec chmod 644 {} \;
-  echo "OK: Permissions fixed: $dir"
-}
-
-wp_menu() {
-  while true; do
-    echo
-    echo "=== WordPress utilities ==="
-    echo "1) Install WP-CLI"
-    echo "2) Download WordPress (vi) to domain webroot"
-    echo "3) Fix permissions (www-data)"
-    echo "0) Back"
-    local c
-    c="$(read_tty "Choose: ")"
-    case "$c" in
-      1) install_wpcli ;;
-      2) wp_download ;;
-      3) wp_fixperm ;;
-      0) return ;;
-      *) echo "Invalid." ;;
-    esac
-  done
+  msg_ok "Fixed permissions: $dir"
 }
 
 nginx_tools() {
   echo
-  echo "--- nginx -t ---"
+  hr
+  echo "${C_BOLD}nginx -t${C_RESET}"
   nginx -t || true
   echo
-  echo "--- status nginx/php-fpm ---"
+  echo "${C_BOLD}status nginx/php-fpm${C_RESET}"
   systemctl status nginx php8.3-fpm --no-pager || true
+  hr
+}
+
+set_update_url() {
+  local url
+  url="$(read_tty "Installer RAW URL (webserver.sh): ")"
+  INSTALL_URL="$url"
+  save_conf
+  msg_ok "Saved INSTALL_URL"
+}
+
+run_update() {
+  if command -v webserver-update >/dev/null 2>&1; then
+    webserver-update
+    msg_ok "Updated via webserver-update"
+    return
+  fi
+  if [[ -z "${INSTALL_URL}" ]]; then
+    msg_err "INSTALL_URL empty. Set it first."
+    return
+  fi
+  curl -fsSL "$INSTALL_URL" | sudo INSTALL_URL="$INSTALL_URL" bash
+  msg_ok "Updated from $INSTALL_URL"
 }
 
 set_root_base() {
@@ -477,51 +481,81 @@ set_root_base() {
   v="$(read_tty "ROOT_BASE (current: ${ROOT_BASE}): ")"
   [[ -n "$v" ]] && ROOT_BASE="$v"
   save_conf
-  echo "OK: ROOT_BASE=${ROOT_BASE}"
+  msg_ok "ROOT_BASE=${ROOT_BASE}"
 }
 
-set_update_url() {
-  local url
-  url="$(read_tty "Raw URL for update (installer) (e.g. https://raw.githubusercontent.com/<user>/<repo>/main/webserver.sh): ")"
-  INSTALL_URL="$url"
-  save_conf
-  echo "OK: saved INSTALL_URL"
+# ---------- Menus ----------
+menu_domain_ssl() {
+  while true; do
+    banner
+    printf "%s%s[DOMAIN / SSL]%s\n" "$C_BOLD" "$C_BLU" "$C_RESET"
+    echo "1) Add Domain (Nginx vhost + webroot)"
+    echo "2) Install SSL (Let's Encrypt + HTTP/2 + auto renew)"
+    echo "0) Back"
+    hr
+    case "$(read_tty "Choose: ")" in
+      1) add_domain; pause ;;
+      2) install_ssl; pause ;;
+      0) return ;;
+      *) msg_warn "Invalid"; pause ;;
+    esac
+  done
 }
 
-run_update() {
-  if [[ -z "${INSTALL_URL}" ]]; then
-    echo "INSTALL_URL is empty. Choose option to set it first."
-    return
-  fi
-  curl -fsSL "$INSTALL_URL" | sudo INSTALL_URL="$INSTALL_URL" bash
-  echo "OK: updated from $INSTALL_URL"
+menu_wordpress() {
+  while true; do
+    banner
+    printf "%s%s[WORDPRESS]%s\n" "$C_BOLD" "$C_BLU" "$C_RESET"
+    echo "1) Install WP-CLI"
+    echo "2) Download WordPress (vi) to domain webroot"
+    echo "3) Fix permissions (www-data)"
+    echo "0) Back"
+    hr
+    case "$(read_tty "Choose: ")" in
+      1) install_wpcli; pause ;;
+      2) wp_download; pause ;;
+      3) wp_fixperm; pause ;;
+      0) return ;;
+      *) msg_warn "Invalid"; pause ;;
+    esac
+  done
+}
+
+menu_system() {
+  while true; do
+    banner
+    printf "%s%s[SYSTEM / TOOLS]%s\n" "$C_BOLD" "$C_BLU" "$C_RESET"
+    echo "1) Nginx tools (test/status)"
+    echo "2) Update installer from GitHub"
+    echo "3) Set update URL"
+    echo "4) Set ROOT_BASE"
+    echo "0) Back"
+    hr
+    case "$(read_tty "Choose: ")" in
+      1) nginx_tools; pause ;;
+      2) run_update; pause ;;
+      3) set_update_url; pause ;;
+      4) set_root_base; pause ;;
+      0) return ;;
+      *) msg_warn "Invalid"; pause ;;
+    esac
+  done
 }
 
 main_menu() {
   while true; do
-    echo
-    echo "==================== DLH MENU ===================="
-    echo "1) Add Domain (Nginx vhost + webroot)"
-    echo "2) Install SSL (Let's Encrypt + HTTP/2 + auto renew)"
-    echo "3) WordPress utilities"
-    echo "4) Nginx tools (test/status)"
-    echo "5) Update installer from GitHub"
-    echo "6) Set update URL"
-    echo "7) Set ROOT_BASE (web root folder)"
+    banner
+    echo "1) Domain / SSL"
+    echo "2) WordPress"
+    echo "3) System / Tools"
     echo "0) Exit"
-    echo "=================================================="
-    local choice
-    choice="$(read_tty "Choose: ")"
-    case "$choice" in
-      1) add_domain ;;
-      2) install_ssl ;;
-      3) wp_menu ;;
-      4) nginx_tools ;;
-      5) run_update ;;
-      6) set_update_url ;;
-      7) set_root_base ;;
+    hr
+    case "$(read_tty "Choose: ")" in
+      1) menu_domain_ssl ;;
+      2) menu_wordpress ;;
+      3) menu_system ;;
       0) exit 0 ;;
-      *) echo "Invalid choice." ;;
+      *) msg_warn "Invalid"; pause ;;
     esac
   done
 }
@@ -529,33 +563,9 @@ main_menu() {
 load_conf
 main_menu
 SH
-
   chmod +x /usr/local/bin/dlh
 }
 
-# ---------------------------
-# Updater command
-# ---------------------------
-install_update_cmd() {
-  write_file "/usr/local/bin/webserver-update" \
-"#!/usr/bin/env bash
-set -euo pipefail
-source /etc/webserver-installer.conf || true
-if [[ -z \"\${INSTALL_URL:-}\" ]]; then
-  echo \"INSTALL_URL is empty.\"
-  echo \"Run installer once with:\"
-  echo \"  curl -fsSL <raw>/webserver.sh | sudo INSTALL_URL='<raw>/webserver.sh' bash\"
-  exit 1
-fi
-curl -fsSL \"\$INSTALL_URL\" | sudo INSTALL_URL=\"\$INSTALL_URL\" bash
-echo \"Update done.\"
-"
-  chmod +x /usr/local/bin/webserver-update
-}
-
-# ---------------------------
-# Main
-# ---------------------------
 main() {
   need_root
   save_conf
@@ -569,7 +579,7 @@ main() {
   echo "[2/6] Nginx + PHP"
   ensure_nginx_php
 
-  echo "[3/6] Nginx global configs (gzip/limits/security)"
+  echo "[3/6] Nginx global configs"
   write_nginx_global_conf
 
   echo "[4/6] Default site (no domain)"
@@ -578,13 +588,12 @@ main() {
   echo "[5/6] Logrotate"
   ensure_logrotate_nginx
 
-  echo "[6/6] Install menu + updater"
+  echo "[6/6] Menu + updater"
   install_dlh_menu
   install_update_cmd
 
   echo "DONE ✅"
   echo "- Run menu: dlh"
-  echo "- Test local: curl -I http://127.0.0.1"
   echo "- Update later: sudo webserver-update"
 }
 
