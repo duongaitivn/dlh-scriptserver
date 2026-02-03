@@ -201,7 +201,7 @@ gzip_types
   write_file "/etc/nginx/conf.d/10-limit-zones.conf" \
 "limit_req_zone \$binary_remote_addr zone=perip:10m rate=5r/s;
 limit_req_zone \$binary_remote_addr zone=login:10m rate=1r/s;
-limit_conn_zone \$binary_remote_addr zone=connperip:10m;
+limit_conn_zone $binary_remote_addr zone=dlh_connperip:10m;
 "
 
   write_file "/etc/nginx/snippets/block-sensitive.conf" \
@@ -213,7 +213,7 @@ location ~* /(composer\\.(json|lock)|package\\.json|yarn\\.lock) { deny all; }
   write_file "/etc/nginx/snippets/basic-antibot.conf" \
 "if (\$bad_ua) { return 444; }
 
-limit_conn connperip 20;
+limit_conn dlh_connperip 20;
 limit_req zone=perip burst=20 nodelay;
 
 location = /xmlrpc.php { deny all; }
