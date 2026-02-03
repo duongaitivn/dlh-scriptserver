@@ -6,7 +6,8 @@ INSTALL_URL="${INSTALL_URL:-}"
 
 EMAIL=""
 DOMAIN=""
-ENABLE_BROTLI="0"   # default off for 1GB VPS
+ENABLE_BROTLI="0"   # default OFF for 1GB VPS
+ZONE_CONN="dlh_connperip"  # avoid conflicts with existing configs
 
 need_root() {
   [[ "${EUID}" -eq 0 ]] || { echo "ERROR: run with sudo"; exit 1; }
@@ -51,7 +52,11 @@ INSTALL_URL=\"${INSTALL_URL}\"
 
 detect_domain_from_nginx() {
   local cand=""
-  cand="$(grep -RhoP '^\s*server_name\s+\K[^;]+' /etc/nginx/sites-enabled 2>/dev/null | tr ' ' '\n' | grep -E '^[A-Za-z0-9.-]+$' | grep -vE '^(localhost|_)$' | head -n 1 || true)"
+  cand="$(grep -RhoP '^\s*server_name\s+\K[^;]+' /etc/nginx/sites-enabled 2>/dev/null \
+    | tr ' ' '\n' \
+    | grep -E '^[A-Za-z0-9.-]+$' \
+    | grep -vE '^(localhost|_)$' \
+    | head -n 1 || true)"
   if [[ -n "$cand" ]]; then
     echo "$cand"
     return
@@ -66,19 +71,33 @@ detect_domain_from_nginx() {
   echo ""
 }
 
+read_tty() {
+  # read from terminal even if script is piped (curl | bash)
+  local prompt="$1"
+  local var=""
+  if [[ -r /dev/tty ]]; then
+    IFS= read -r -p "$prompt" var </dev/tty || true
+  else
+    IFS= read -r -p "$prompt" var || true
+  fi
+  printf "%s" "$var"
+}
+
 ask_email_only() {
   echo "=== Webserver basic setup ==="
 
   if [[ -n "${EMAIL}" ]]; then
     echo "Current EMAIL: ${EMAIL}"
-    read -r -p "Keep this email? (Y/n): " keep || true
+    local keep
+    keep="$(read_tty "Keep this email? (Y/n): ")"
     keep="${keep:-Y}"
     if [[ "$keep" =~ ^[Yy]$ ]]; then
       return
     fi
   fi
 
-  read -r -p "Enter email for Let's Encrypt (e.g. admin@example.com): " e
+  local e
+  e="$(read_tty "Enter email for Let's Encrypt (e.g. admin@example.com): ")"
   EMAIL="${e:-$EMAIL}"
 
   if [[ -z "$EMAIL" ]]; then
@@ -104,8 +123,9 @@ ensure_fail2ban() {
     apt_install fail2ban
   fi
   systemctl enable --now fail2ban
+
   if [[ ! -f /etc/fail2ban/jail.local ]]; then
-    write_file "/etc/fail2ban/jail.local" \
+    write_file /etc/fail2ban/jail.local \
 "[sshd]
 enabled = true
 maxretry = 5
@@ -113,6 +133,7 @@ findtime = 10m
 bantime = 2h
 "
   fi
+
   systemctl restart fail2ban
 }
 
@@ -125,7 +146,7 @@ ensure_swap_2g() {
   mkswap /swapfile
   swapon /swapfile
   grep -q '^/swapfile' /etc/fstab || echo '/swapfile none swap sw 0 0' >> /etc/fstab
-  write_file "/etc/sysctl.d/99-swappiness.conf" "vm.swappiness=10
+  write_file /etc/sysctl.d/99-swappiness.conf "vm.swappiness=10
 "
   sysctl -p /etc/sysctl.d/99-swappiness.conf >/dev/null || true
 }
@@ -137,6 +158,7 @@ ensure_nginx_php() {
   systemctl enable --now nginx
   systemctl enable --now php8.3-fpm
 
+  # PHP-FPM tuning for 1GB
   local pool="/etc/php/8.3/fpm/pool.d/www.conf"
   if [[ -f "$pool" ]]; then
     sed -i 's/^pm = .*/pm = ondemand/' "$pool" || true
@@ -148,8 +170,7 @@ ensure_nginx_php() {
 }
 
 gzip_already_enabled_elsewhere() {
-  # Find "gzip on;" excluding our own file (to avoid self-detection).
-  # Return 0 if found elsewhere, 1 otherwise.
+  # detect gzip on; outside our file
   local hits=""
   hits="$(grep -RIn "^\s*gzip\s\+on\s*;" /etc/nginx/nginx.conf /etc/nginx/conf.d /etc/nginx/sites-enabled 2>/dev/null \
     | grep -v "/etc/nginx/conf.d/01-gzip.conf" || true)"
@@ -162,6 +183,15 @@ disable_our_gzip_conf() {
   fi
 }
 
+ensure_limit_zones_unique() {
+  # Always overwrite with our desired zones to avoid duplicates
+  write_file "/etc/nginx/conf.d/10-limit-zones.conf" \
+"limit_req_zone \$binary_remote_addr zone=perip:10m rate=5r/s;
+limit_req_zone \$binary_remote_addr zone=login:10m rate=1r/s;
+limit_conn_zone \$binary_remote_addr zone=${ZONE_CONN}:10m;
+"
+}
+
 write_nginx_global_conf() {
   write_file "/etc/nginx/conf.d/00-security.conf" \
 "server_tokens off;
@@ -172,8 +202,7 @@ map \$http_user_agent \$bad_ua {
 }
 "
 
-  # ---- FIX: avoid duplicate gzip on; ----
-  # If gzip already exists in nginx.conf or other conf files, do NOT create our gzip file.
+  # gzip: only create if not already enabled elsewhere
   if gzip_already_enabled_elsewhere; then
     echo "INFO: Detected existing 'gzip on;' in current Nginx config -> skip creating /etc/nginx/conf.d/01-gzip.conf"
     disable_our_gzip_conf
@@ -198,11 +227,7 @@ gzip_types
 "
   fi
 
-  write_file "/etc/nginx/conf.d/10-limit-zones.conf" \
-"limit_req_zone \$binary_remote_addr zone=perip:10m rate=5r/s;
-limit_req_zone \$binary_remote_addr zone=login:10m rate=1r/s;
-limit_conn_zone $binary_remote_addr zone=dlh_connperip:10m;
-"
+  ensure_limit_zones_unique
 
   write_file "/etc/nginx/snippets/block-sensitive.conf" \
 "location ~* /\\.((?!well-known).)* { deny all; }
@@ -213,9 +238,11 @@ location ~* /(composer\\.(json|lock)|package\\.json|yarn\\.lock) { deny all; }
   write_file "/etc/nginx/snippets/basic-antibot.conf" \
 "if (\$bad_ua) { return 444; }
 
-limit_conn dlh_connperip 20;
+# Mild global limiting (safe for 1GB)
+limit_conn ${ZONE_CONN} 20;
 limit_req zone=perip burst=20 nodelay;
 
+# Common abuse endpoints (WP)
 location = /xmlrpc.php { deny all; }
 
 location = /wp-login.php {
@@ -331,12 +358,11 @@ set -euo pipefail
 source /etc/webserver-installer.conf || true
 if [[ -z \"\${INSTALL_URL:-}\" ]]; then
   echo \"INSTALL_URL is empty.\"
-  echo \"Reinstall using:\"
-  echo \"  sudo bash -c 'INSTALL_URL=\\\"https://raw.githubusercontent.com/<user>/<repo>/main/webserver.sh\\\"; curl -fsSL \\\"\\\$INSTALL_URL\\\" -o /tmp/webserver.sh && sudo bash /tmp/webserver.sh'\"
+  echo \"Run installer with:\"
+  echo \"  curl -fsSL https://raw.githubusercontent.com/<user>/<repo>/main/webserver.sh | sudo INSTALL_URL=... bash\"
   exit 1
 fi
-curl -fsSL \"\$INSTALL_URL\" -o /tmp/webserver.sh
-sudo bash /tmp/webserver.sh
+curl -fsSL \"\$INSTALL_URL\" | sudo INSTALL_URL=\"\$INSTALL_URL\" bash
 echo \"Update done.\"
 "
   chmod +x /usr/local/bin/webserver-update
@@ -351,6 +377,8 @@ main() {
   fi
 
   ask_email_only
+
+  # Persist config (including INSTALL_URL if provided)
   save_conf
 
   echo "[1/6] UFW + Fail2ban + Swap"
@@ -377,7 +405,7 @@ main() {
 
   echo "DONE ✅"
   echo "- Update later: sudo webserver-update"
-  echo "- Check: sudo nginx -t"
+  echo "- Check config: sudo nginx -t"
 }
 
 main
