@@ -1,20 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# =========================================================
-# DLH Webserver Basic Installer (Ubuntu 24.04 / 1GB RAM)
-# - Nginx + PHP-FPM
-# - UFW + Fail2ban + Swap
-# - gzip (skip if already enabled) + anti-bot + rate-limit zones
-# - logrotate
-# - NO domain auto-detect, NO SSL auto
-# - Installs "dlh" menu (HOCVPS-like UI)
-# - Installs "webserver-update" to self-update from GitHub raw URL
-#
-# Run:
-#   curl -fsSL <RAW>/webserver.sh | sudo INSTALL_URL="<RAW>/webserver.sh" bash
-# =========================================================
-
 CONF="/etc/webserver-installer.conf"
 INSTALL_URL="${INSTALL_URL:-}"
 ZONE_CONN="dlh_connperip"
