@@ -84,6 +84,7 @@ ensure_nginx_php() {
   systemctl enable --now nginx
   systemctl enable --now php8.3-fpm
 
+  # PHP-FPM tuning for 1GB
   local pool="/etc/php/8.3/fpm/pool.d/www.conf"
   if [[ -f "$pool" ]]; then
     sed -i 's/^pm = .*/pm = ondemand/' "$pool" || true
@@ -101,8 +102,12 @@ gzip_already_enabled_elsewhere() {
   [[ -n "$hits" ]]
 }
 
+# FIX: Must NOT exit when file doesn't exist under "set -e"
 disable_our_gzip_conf() {
-  [[ -f /etc/nginx/conf.d/01-gzip.conf ]] && mv /etc/nginx/conf.d/01-gzip.conf /etc/nginx/conf.d/01-gzip.conf.off
+  if [[ -f /etc/nginx/conf.d/01-gzip.conf ]]; then
+    mv /etc/nginx/conf.d/01-gzip.conf /etc/nginx/conf.d/01-gzip.conf.off
+  fi
+  return 0
 }
 
 ensure_limit_zones() {
@@ -250,7 +255,6 @@ CONF="/etc/dlh-menu.conf"
 ROOT_BASE_DEFAULT="/var/www"
 PHP_SOCK="/run/php/php8.3-fpm.sock"
 
-# ---------- UI ----------
 is_tty() { [[ -t 1 ]]; }
 if is_tty; then
   C_RESET=$'\033[0m'
@@ -266,8 +270,6 @@ else
 fi
 
 hr() { printf "%s\n" "------------------------------------------------------------"; }
-pause() { read_tty "Press Enter to continue..."; }
-
 clear_screen() { is_tty && clear || true; }
 
 read_tty() {
@@ -279,6 +281,7 @@ read_tty() {
   fi
   printf "%s" "$var"
 }
+pause() { read_tty "Press Enter to continue..."; }
 
 banner() {
   clear_screen
@@ -286,6 +289,10 @@ banner() {
   printf "%sBasic Webserver (Nginx/PHP/SSL/WP) - menu style like HOCVPS%s\n" "$C_DIM" "$C_RESET"
   hr
 }
+
+msg_ok()   { printf "%s[OK]%s %s\n"   "$C_GRN" "$C_RESET" "$*"; }
+msg_warn() { printf "%s[WARN]%s %s\n" "$C_YEL" "$C_RESET" "$*"; }
+msg_err()  { printf "%s[ERR]%s %s\n"  "$C_RED" "$C_RESET" "$*"; }
 
 # auto sudo
 if [[ "${EUID}" -ne 0 ]]; then
@@ -326,10 +333,6 @@ location = /xmlrpc.php { deny all; }
 location = /wp-login.php { try_files \$uri \$uri/ /index.php?\$args; }
 EOF
 }
-
-msg_ok() { printf "%s[OK]%s %s\n" "$C_GRN" "$C_RESET" "$*"; }
-msg_warn() { printf "%s[WARN]%s %s\n" "$C_YEL" "$C_RESET" "$*"; }
-msg_err() { printf "%s[ERR]%s %s\n" "$C_RED" "$C_RESET" "$*"; }
 
 # ---------- Actions ----------
 add_domain() {
@@ -372,28 +375,53 @@ EOF
   msg_ok "Webroot: ${webroot}"
 }
 
+# DNS check without extra packages:
+dns_exists() {
+  local host="$1"
+  getent ahosts "$host" >/dev/null 2>&1
+}
+
 install_ssl() {
-  local domain email
-  domain="$(read_tty "Domain for SSL: ")"
+  local domain email add_www ans
+  domain="$(read_tty "Domain for SSL (e.g. example.com): ")"
   domain="${domain,,}"
   [[ -n "$domain" ]] || { msg_err "Domain empty"; return; }
 
   email="$(read_tty "Email for Let's Encrypt: ")"
   [[ -n "$email" ]] || { msg_err "Email empty"; return; }
 
+  ans="$(read_tty "Include www.${domain}? (y/N): ")"
+  ans="${ans,,}"
+  add_www="0"
+  [[ "$ans" == "y" || "$ans" == "yes" ]] && add_www="1"
+
   apt-get update -y
   apt-get install -y certbot python3-certbot-nginx
 
-  if ! certbot --nginx -d "$domain" -d "www.$domain" -m "$email" --agree-tos --non-interactive --redirect; then
-    msg_warn "SSL failed. If using Cloudflare, try DNS-only temporarily, ensure port 80 reachable."
+  local args=(-d "$domain")
+  if [[ "$add_www" == "1" ]]; then
+    if dns_exists "www.${domain}"; then
+      args+=(-d "www.${domain}")
+    else
+      msg_warn "DNS for www.${domain} not found (NXDOMAIN). Will issue SSL for ${domain} only."
+    fi
+  fi
+
+  if ! certbot --nginx "${args[@]}" -m "$email" --agree-tos --non-interactive --redirect; then
+    msg_warn "SSL failed. Check DNS/Cloudflare and ensure port 80 reachable."
     return
   fi
 
   systemctl enable --now certbot.timer || true
+
+  # best-effort enable HTTP/2
   sed -i 's/listen 443 ssl;/listen 443 ssl http2;/' /etc/nginx/sites-enabled/*.conf 2>/dev/null || true
   sed -i 's/listen \[::\]:443 ssl;/listen [::]:443 ssl http2;/' /etc/nginx/sites-enabled/*.conf 2>/dev/null || true
+
   nginx_reload
-  msg_ok "SSL installed: https://${domain}"
+  msg_ok "SSL installed."
+  msg_ok "Domain: https://${domain}"
+  [[ "$add_www" == "1" ]] && msg_ok "www included if DNS exists."
 }
 
 install_wpcli() {
@@ -443,15 +471,34 @@ wp_fixperm() {
   msg_ok "Fixed permissions: $dir"
 }
 
+wp_menu() {
+  while true; do
+    banner
+    printf "%s%s[WORDPRESS]%s\n" "$C_BOLD" "$C_BLU" "$C_RESET"
+    echo "1) Install WP-CLI"
+    echo "2) Download WordPress (vi) to domain webroot"
+    echo "3) Fix permissions (www-data)"
+    echo "0) Back"
+    hr
+    case "$(read_tty "Choose: ")" in
+      1) install_wpcli; pause ;;
+      2) wp_download; pause ;;
+      3) wp_fixperm; pause ;;
+      0) return ;;
+      *) msg_warn "Invalid"; pause ;;
+    esac
+  done
+}
+
 nginx_tools() {
-  echo
-  hr
+  banner
   echo "${C_BOLD}nginx -t${C_RESET}"
   nginx -t || true
   echo
   echo "${C_BOLD}status nginx/php-fpm${C_RESET}"
   systemctl status nginx php8.3-fpm --no-pager || true
   hr
+  pause
 }
 
 set_update_url() {
@@ -484,7 +531,6 @@ set_root_base() {
   msg_ok "ROOT_BASE=${ROOT_BASE}"
 }
 
-# ---------- Menus ----------
 menu_domain_ssl() {
   while true; do
     banner
@@ -502,25 +548,6 @@ menu_domain_ssl() {
   done
 }
 
-menu_wordpress() {
-  while true; do
-    banner
-    printf "%s%s[WORDPRESS]%s\n" "$C_BOLD" "$C_BLU" "$C_RESET"
-    echo "1) Install WP-CLI"
-    echo "2) Download WordPress (vi) to domain webroot"
-    echo "3) Fix permissions (www-data)"
-    echo "0) Back"
-    hr
-    case "$(read_tty "Choose: ")" in
-      1) install_wpcli; pause ;;
-      2) wp_download; pause ;;
-      3) wp_fixperm; pause ;;
-      0) return ;;
-      *) msg_warn "Invalid"; pause ;;
-    esac
-  done
-}
-
 menu_system() {
   while true; do
     banner
@@ -532,7 +559,7 @@ menu_system() {
     echo "0) Back"
     hr
     case "$(read_tty "Choose: ")" in
-      1) nginx_tools; pause ;;
+      1) nginx_tools ;;
       2) run_update; pause ;;
       3) set_update_url; pause ;;
       4) set_root_base; pause ;;
@@ -552,7 +579,7 @@ main_menu() {
     hr
     case "$(read_tty "Choose: ")" in
       1) menu_domain_ssl ;;
-      2) menu_wordpress ;;
+      2) wp_menu ;;
       3) menu_system ;;
       0) exit 0 ;;
       *) msg_warn "Invalid"; pause ;;
