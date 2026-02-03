@@ -407,14 +407,12 @@ install_ssl() {
   fi
 
   systemctl enable --now certbot.timer || true
-
   sed -i 's/listen 443 ssl;/listen 443 ssl http2;/' /etc/nginx/sites-enabled/*.conf 2>/dev/null || true
   sed -i 's/listen \[::\]:443 ssl;/listen [::]:443 ssl http2;/' /etc/nginx/sites-enabled/*.conf 2>/dev/null || true
-
   nginx_reload
-  msg_ok "SSL installed."
-  msg_ok "Domain: https://${domain}"
+  msg_ok "SSL installed: https://${domain}"
 }
+
 
 install_wpcli() {
   if command -v wp >/dev/null 2>&1; then
