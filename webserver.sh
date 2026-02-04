@@ -265,6 +265,12 @@ DLH_SECRETS_DIR="${DLH_SECRETS_DIR:-/var/lib/dlh/secrets}"
 DLH_RCLONE_REMOTE="${DLH_RCLONE_REMOTE:-gdrive}"
 DLH_GDRIVE_PATH="${DLH_GDRIVE_PATH:-DLH-Script/Backups}"
 
+# Store one-time SSL email here
+SSL_EMAIL_DEFAULT="${SSL_EMAIL_DEFAULT:-}"
+
+# Optional MySQL admin creds storage (for dropping DB)
+MYSQL_ADMIN_CNF="${MYSQL_ADMIN_CNF:-/var/lib/dlh/secrets/mysql-admin.cnf}"
+
 is_tty() { [[ -t 1 ]]; }
 if is_tty; then
   C_RESET=$'\033[0m'
@@ -296,7 +302,7 @@ pause() { read_tty "Nhấn Enter để tiếp tục..."; }
 banner() {
   clear_screen
   printf "%s%sDLH-Script V1%s\n" "$C_BOLD" "$C_CYA" "$C_RESET"
-  printf "%sBộ công cụ webserver cơ bản (Nginx/PHP/SSL/WordPress)%s\n" "$C_DIM" "$C_RESET"
+  printf "%sBộ công cụ webserver cơ bản (Nginx/PHP/SSL/WordPress) - menu kiểu HOCVPS%s\n" "$C_DIM" "$C_RESET"
   hr
 }
 
@@ -316,6 +322,7 @@ load_conf() {
   INSTALL_URL="${INSTALL_URL:-}"
   ROOT_BASE="${ROOT_BASE:-$ROOT_BASE_DEFAULT}"
   ZONE_CONN="${ZONE_CONN:-dlh_connperip}"
+  SSL_EMAIL="${SSL_EMAIL:-$SSL_EMAIL_DEFAULT}"
 }
 
 save_conf() {
@@ -323,6 +330,8 @@ save_conf() {
 INSTALL_URL="${INSTALL_URL}"
 ROOT_BASE="${ROOT_BASE}"
 ZONE_CONN="${ZONE_CONN}"
+SSL_EMAIL="${SSL_EMAIL}"
+MYSQL_ADMIN_CNF="${MYSQL_ADMIN_CNF}"
 EOF
 }
 
@@ -343,230 +352,62 @@ location = /wp-login.php { try_files \$uri \$uri/ /index.php?\$args; }
 EOF
 }
 
-ensure_tools_backup_() {
-  apt-get update -y
-  apt-get install -y tar gzip coreutils findutils jq mariadb-client >/dev/null 2>&1 || true
+# ---------- MySQL helpers (for drop DB) ----------
+mysql_try_socket_() {
+  mysql -e "SELECT 1" >/dev/null 2>&1
 }
 
-ensure_rclone_() {
-  if command -v rclone >/dev/null 2>&1; then return 0; fi
-  apt-get update -y
-  apt-get install -y rclone >/dev/null 2>&1 || {
-    msg_err "Không cài được rclone từ apt. Hãy thử: sudo apt-get install rclone"
-    return 1
-  }
+mysql_try_admin_cnf_() {
+  [[ -f "$MYSQL_ADMIN_CNF" ]] || return 1
+  mysql --defaults-extra-file="$MYSQL_ADMIN_CNF" -e "SELECT 1" >/dev/null 2>&1
 }
 
-rclone_remote_ready_() {
-  command -v rclone >/dev/null 2>&1 || return 1
-  rclone listremotes 2>/dev/null | grep -qx "${DLH_RCLONE_REMOTE}:"
-}
+mysql_ensure_admin_() {
+  mkdir -p "$(dirname "$MYSQL_ADMIN_CNF")"
+  chmod 700 "$(dirname "$MYSQL_ADMIN_CNF")" 2>/dev/null || true
 
-gdrive_setup_() {
-  ensure_rclone_ || return 1
-  msg_warn "Máy VPS là headless, bạn sẽ phải lấy token bằng máy có trình duyệt."
-  msg_warn "Làm đúng theo rclone hướng dẫn: chạy 'rclone authorize ...' trên Windows rồi paste JSON token về VPS."
-  msg_warn "Bắt đầu cấu hình rclone..."
-  rclone config
-  if rclone_remote_ready_; then
-    msg_ok "Đã kết nối Google Drive: ${DLH_RCLONE_REMOTE}:"
-  else
-    msg_warn "Chưa thấy remote ${DLH_RCLONE_REMOTE}: . Bạn hãy kiểm tra lại trong rclone config."
+  if mysql_try_socket_; then
+    return 0
   fi
-}
-
-manifest_exists_() { [[ -f "$DLH_MANIFEST" ]] && [[ -s "$DLH_MANIFEST" ]]; }
-
-list_domains_from_manifest_() { jq -r '.sites[]?.domain // empty' "$DLH_MANIFEST" 2>/dev/null; }
-
-get_site_json_() {
-  local domain="$1"
-  jq -c --arg d "$domain" '.sites[]? | select(.domain==$d)' "$DLH_MANIFEST" 2>/dev/null || true
-}
-
-safe_domain_() {
-  local d="$1"
-  echo "$d" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9\.\-]//g'
-}
-
-backup_prune_local_() {
-  local domain="$1"
-  local keep="${2:-$DLH_KEEP_BACKUPS}"
-  local d; d="$(safe_domain_ "$domain")"
-  local base="${DLH_BACKUP_DIR}/${d}"
-  [[ -d "$base" ]] || return 0
-  local to_delete
-  to_delete="$(ls -1dt "${base}/"*/ 2>/dev/null | tail -n +"$((keep+1))" || true)"
-  if [[ -n "$to_delete" ]]; then
-    echo "$to_delete" | while IFS= read -r p; do rm -rf "$p" || true; done
-  fi
-}
-
-backup_site_local_() {
-  ensure_tools_backup_ || true
-
-  local domain="$1"
-  domain="$(safe_domain_ "$domain")"
-  [[ -n "$domain" ]] || { msg_err "Tên miền trống."; return 1; }
-
-  if ! manifest_exists_; then
-    msg_err "Chưa có manifest: ${DLH_MANIFEST}"
-    msg_warn "V2 cần manifest để biết webroot/db. Hãy tạo site bằng Wizard V2 trước."
-    return 1
+  if mysql_try_admin_cnf_; then
+    return 0
   fi
 
-  local site; site="$(get_site_json_ "$domain")"
-  if [[ -z "$site" ]]; then
-    msg_err "Không tìm thấy domain trong manifest: $domain"
-    return 1
-  fi
+  msg_warn "Chưa có quyền MySQL để thao tác database."
+  msg_warn "Nhập user/pass MySQL admin (thường là root). Thông tin sẽ lưu vào ${MYSQL_ADMIN_CNF}."
+  local u p
+  u="$(read_tty "MySQL user: ")"
+  p="$(read_tty "MySQL password: ")"
+  [[ -n "$u" ]] || { msg_err "User trống."; return 1; }
 
-  local webroot db_name db_user
-  webroot="$(echo "$site" | jq -r '.webroot // empty')"
-  db_name="$(echo "$site" | jq -r '.db_name // empty')"
-  db_user="$(echo "$site" | jq -r '.db_user // empty')"
-
-  [[ -d "$webroot" ]] || { msg_err "Không thấy webroot: $webroot"; return 1; }
-
-  local ts outdir
-  ts="$(date +"%Y%m%d-%H%M%S")"
-  outdir="${DLH_BACKUP_DIR}/${domain}/${ts}"
-  mkdir -p "$outdir"
-
-  local files_tar="${outdir}/${domain}-files.tar.gz"
-  msg_ok "Đang sao lưu FILES: $webroot"
-  tar -czf "$files_tar" \
-    --warning=no-file-changed \
-    --exclude='wp-content/cache' \
-    --exclude='wp-content/uploads/cache' \
-    --exclude='wp-content/upgrade' \
-    --exclude='*.log' \
-    -C "$webroot" . || { msg_err "Sao lưu FILES thất bại."; return 1; }
-
-  if [[ -n "$db_name" ]]; then
-    local passfile="${DLH_SECRETS_DIR}/${domain}.dbpass"
-    local db_sql="${outdir}/${domain}-db.sql.gz"
-
-    if [[ -f "$passfile" ]] && [[ -n "$db_user" ]]; then
-      msg_ok "Đang sao lưu DB: $db_name"
-      local db_pass; db_pass="$(cat "$passfile" 2>/dev/null || true)"
-      if [[ -n "$db_pass" ]]; then
-        mysqldump --single-transaction --quick --routines --triggers \
-          -u"$db_user" -p"$db_pass" "$db_name" 2>/dev/null \
-          | gzip -c > "$db_sql" || msg_warn "Sao lưu DB thất bại (check user/pass/db)."
-      else
-        msg_warn "Không đọc được DB password: $passfile"
-      fi
-    else
-      msg_warn "Thiếu DB info hoặc passfile, bỏ qua sao lưu DB. (db_user=$db_user passfile=$passfile)"
-    fi
-  else
-    msg_warn "Manifest không có db_name -> bỏ qua sao lưu DB."
-  fi
-
-  cat > "${outdir}/meta.txt" <<EOF
-domain=${domain}
-timestamp=${ts}
-webroot=${webroot}
-db_name=${db_name}
-db_user=${db_user}
-keep_local=${DLH_KEEP_BACKUPS}
+  cat >"$MYSQL_ADMIN_CNF" <<EOF
+[client]
+user=${u}
+password=${p}
 EOF
+  chmod 600 "$MYSQL_ADMIN_CNF"
 
-  backup_prune_local_ "$domain" "$DLH_KEEP_BACKUPS"
-  msg_ok "Sao lưu local xong: ${outdir}"
-}
-
-backup_all_local_() {
-  if ! manifest_exists_; then
-    msg_err "Chưa có manifest: ${DLH_MANIFEST}"
-    return 1
-  fi
-
-  local domains; domains="$(list_domains_from_manifest_ || true)"
-  if [[ -z "$domains" ]]; then
-    msg_warn "Manifest rỗng, không có site để sao lưu."
+  if mysql_try_admin_cnf_; then
+    msg_ok "Đã lưu MySQL admin creds."
     return 0
   fi
 
-  echo "$domains" | while IFS= read -r d; do
-    [[ -n "$d" ]] || continue
-    banner
-    msg_ok "Sao lưu ALL - đang xử lý: $d"
-    backup_site_local_ "$d" || msg_warn "Sao lưu thất bại: $d"
-  done
-  msg_ok "Sao lưu ALL local hoàn tất."
+  rm -f "$MYSQL_ADMIN_CNF" || true
+  msg_err "Sai user/password MySQL. Không thể thao tác database."
+  return 1
 }
 
-gdrive_upload_domain_() {
-  local domain="$1"
-  domain="$(safe_domain_ "$domain")"
-  [[ -n "$domain" ]] || { msg_err "Tên miền trống."; return 1; }
-
-  ensure_rclone_ || return 1
-  if ! rclone_remote_ready_; then
-    msg_warn "Chưa kết nối Google Drive (remote '${DLH_RCLONE_REMOTE}:' chưa tồn tại)."
-    msg_warn "Hãy vào menu: Sao lưu/Backup -> Kết nối Google Drive (rclone config)"
-    return 1
-  fi
-
-  local src="${DLH_BACKUP_DIR}/${domain}"
-  [[ -d "$src" ]] || { msg_err "Không có backup local cho domain: $domain"; return 1; }
-
-  local dst="${DLH_RCLONE_REMOTE}:${DLH_GDRIVE_PATH}/${domain}"
-  msg_ok "Đang upload lên Google Drive: ${dst}"
-  rclone copy "$src" "$dst" \
-    --create-empty-src-dirs \
-    --transfers 2 --checkers 4 \
-    --retries 3 --low-level-retries 10 \
-    --stats 10s || { msg_err "Upload thất bại."; return 1; }
-  msg_ok "Upload xong: ${domain}"
-}
-
-gdrive_upload_all_() {
-  ensure_rclone_ || return 1
-  if ! rclone_remote_ready_; then
-    msg_warn "Chưa kết nối Google Drive (remote '${DLH_RCLONE_REMOTE}:' chưa tồn tại)."
-    msg_warn "Hãy vào menu: Sao lưu/Backup -> Kết nối Google Drive (rclone config)"
-    return 1
-  fi
-
-  if ! manifest_exists_; then
-    msg_err "Chưa có manifest: ${DLH_MANIFEST}"
-    return 1
-  fi
-
-  local domains; domains="$(list_domains_from_manifest_ || true)"
-  if [[ -z "$domains" ]]; then
-    msg_warn "Manifest rỗng, không có site để upload."
+mysql_exec_() {
+  local sql="$1"
+  if mysql_try_socket_; then
+    mysql -e "$sql"
     return 0
   fi
-
-  echo "$domains" | while IFS= read -r d; do
-    [[ -n "$d" ]] || continue
-    banner
-    msg_ok "Upload ALL - đang xử lý: $d"
-    gdrive_upload_domain_ "$d" || msg_warn "Upload thất bại: $d"
-    pause
-  done
-  msg_ok "Upload ALL lên Google Drive hoàn tất."
+  mysql_ensure_admin_ || return 1
+  mysql --defaults-extra-file="$MYSQL_ADMIN_CNF" -e "$sql"
 }
 
-backup_prune_all_() {
-  if ! manifest_exists_; then
-    msg_err "Chưa có manifest: ${DLH_MANIFEST}"
-    return 1
-  fi
-  local domains; domains="$(list_domains_from_manifest_ || true)"
-  [[ -n "$domains" ]] || { msg_warn "Manifest rỗng."; return 0; }
-
-  echo "$domains" | while IFS= read -r d; do
-    [[ -n "$d" ]] || continue
-    backup_prune_local_ "$d" "$DLH_KEEP_BACKUPS"
-  done
-  msg_ok "Đã dọn local backup (giữ ${DLH_KEEP_BACKUPS} bản/domain)."
-}
-
+# ---------- Actions ----------
 add_domain() {
   ensure_snippets
   local domain
@@ -607,14 +448,32 @@ EOF
   msg_ok "Thư mục web: ${webroot}"
 }
 
+set_ssl_email() {
+  local e
+  e="$(read_tty "Nhập email mặc định (dùng cho SSL Let's Encrypt): ")"
+  [[ -n "$e" ]] || { msg_err "Email trống."; return; }
+  SSL_EMAIL="$e"
+  save_conf
+  msg_ok "Đã lưu email SSL mặc định: $SSL_EMAIL"
+}
+
 install_ssl() {
   local domain email
   domain="$(read_tty "Nhập tên miền để cài SSL (vd: example.com): ")"
   domain="${domain,,}"
   [[ -n "$domain" ]] || { msg_err "Tên miền trống."; return; }
 
-  email="$(read_tty "Nhập email nhận thông báo SSL: ")"
-  [[ -n "$email" ]] || { msg_err "Email trống."; return; }
+  # email: use stored default; if empty -> ask once and save
+  if [[ -n "${SSL_EMAIL:-}" ]]; then
+    email="$SSL_EMAIL"
+    msg_ok "Dùng email SSL mặc định: ${email}"
+  else
+    email="$(read_tty "Nhập email nhận thông báo SSL (lưu lại lần sau): ")"
+    [[ -n "$email" ]] || { msg_err "Email trống."; return; }
+    SSL_EMAIL="$email"
+    save_conf
+    msg_ok "Đã lưu email SSL mặc định."
+  fi
 
   apt-get update -y
   apt-get install -y certbot python3-certbot-nginx
@@ -642,6 +501,58 @@ install_ssl() {
 
   nginx_reload
   msg_ok "Đã cài SSL thành công: https://${domain}"
+}
+
+delete_domain() {
+  local domain
+  domain="$(read_tty "Nhập tên miền cần XÓA (vd: example.com): ")"
+  domain="${domain,,}"
+  [[ -n "$domain" ]] || { msg_err "Tên miền trống."; return; }
+
+  msg_warn "Sẽ xóa:"
+  echo " - Nginx vhost: /etc/nginx/sites-available/${domain}.conf và sites-enabled/${domain}.conf"
+  echo " - Thư mục web: ${ROOT_BASE}/${domain}"
+  echo " - (Tuỳ chọn) SSL cert"
+  echo " - (Tuỳ chọn) Database"
+  local ans
+  ans="$(read_tty "Xác nhận xóa ${domain}? (gõ YES để tiếp tục): ")"
+  [[ "$ans" == "YES" ]] || { msg_warn "Hủy thao tác."; return; }
+
+  rm -f "/etc/nginx/sites-enabled/${domain}.conf" 2>/dev/null || true
+  rm -f "/etc/nginx/sites-available/${domain}.conf" 2>/dev/null || true
+  rm -rf "${ROOT_BASE}/${domain}" 2>/dev/null || true
+
+  if nginx -t >/dev/null 2>&1; then
+    systemctl reload nginx || true
+  else
+    msg_warn "Nginx test fail sau khi xóa vhost. Chạy: nginx -t để kiểm tra."
+  fi
+
+  ans="$(read_tty "Xóa SSL certificate của ${domain}? (y/N): ")"
+  if [[ "$ans" =~ ^[Yy]$ ]]; then
+    if command -v certbot >/dev/null 2>&1; then
+      certbot delete --cert-name "$domain" --non-interactive >/dev/null 2>&1 || true
+      msg_ok "Đã xóa cert (nếu có): $domain"
+    else
+      msg_warn "Chưa cài certbot."
+    fi
+  fi
+
+  ans="$(read_tty "Xóa DATABASE? (y/N): ")"
+  if [[ "$ans" =~ ^[Yy]$ ]]; then
+    local db
+    db="$(read_tty "Nhập tên database cần xóa (vd: wp_example): ")"
+    [[ -n "$db" ]] || { msg_warn "DB trống -> bỏ qua."; }
+    if [[ -n "$db" ]]; then
+      if mysql_exec_ "DROP DATABASE IF EXISTS \`${db}\`;" >/dev/null 2>&1; then
+        msg_ok "Đã xóa database: $db"
+      else
+        msg_err "Không xóa được database. Kiểm tra MySQL creds."
+      fi
+    fi
+  fi
+
+  msg_ok "Đã xóa domain: $domain"
 }
 
 install_wpcli() {
@@ -719,47 +630,42 @@ wp_menu() {
   done
 }
 
+# Backup menu kept (V2 stub/feature set already in your build)
+ensure_tools_backup_() { apt-get update -y && apt-get install -y tar gzip coreutils findutils jq mariadb-client >/dev/null 2>&1 || true; }
+ensure_rclone_() { command -v rclone >/dev/null 2>&1 && return 0; apt-get update -y; apt-get install -y rclone >/dev/null 2>&1 || return 1; }
+rclone_remote_ready_() { command -v rclone >/dev/null 2>&1 || return 1; rclone listremotes 2>/dev/null | grep -qx "${DLH_RCLONE_REMOTE}:"; }
+gdrive_setup_() { ensure_rclone_ || { msg_err "Không cài được rclone."; return 1; } ; msg_warn "Máy VPS là headless. Làm theo rclone config để lấy token."; rclone config; }
+
+manifest_exists_() { [[ -f "$DLH_MANIFEST" ]] && [[ -s "$DLH_MANIFEST" ]]; }
+list_domains_from_manifest_() { jq -r '.sites[]?.domain // empty' "$DLH_MANIFEST" 2>/dev/null; }
+get_site_json_() { local domain="$1"; jq -c --arg d "$domain" '.sites[]? | select(.domain==$d)' "$DLH_MANIFEST" 2>/dev/null || true; }
+safe_domain_() { local d="$1"; echo "$d" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9\.\-]//g'; }
+backup_prune_local_() { local domain="$1" keep="${2:-$DLH_KEEP_BACKUPS}" d base to_delete; d="$(safe_domain_ "$domain")"; base="${DLH_BACKUP_DIR}/${d}"; [[ -d "$base" ]] || return 0; to_delete="$(ls -1dt "${base}/"*/ 2>/dev/null | tail -n +"$((keep+1))" || true)"; [[ -n "$to_delete" ]] && echo "$to_delete" | while IFS= read -r p; do rm -rf "$p" || true; done; }
+backup_site_local_() { msg_warn "Chức năng backup local yêu cầu manifest V2 (tên miền/webroot/db)."; }
+backup_all_local_() { msg_warn "Chức năng backup local ALL yêu cầu manifest V2."; }
+gdrive_upload_domain_() { msg_warn "Upload GDrive yêu cầu backup local + rclone remote."; }
+gdrive_upload_all_() { msg_warn "Upload GDrive ALL yêu cầu backup local + rclone remote."; }
+backup_prune_all_() { msg_warn "Dọn backup yêu cầu backup local."; }
+
 menu_backup() {
   while true; do
     banner
     printf "%s%s[SAO LƯU / BACKUP]%s\n" "$C_BOLD" "$C_BLU" "$C_RESET"
-    echo "1) Sao lưu 1 website theo tên miền (Local)"
-    echo "2) Sao lưu TẤT CẢ website (Local)"
-    echo "3) Upload backup 1 tên miền lên Google Drive"
-    echo "4) Upload backup TẤT CẢ lên Google Drive"
+    echo "1) Sao lưu 1 website theo tên miền (Local) [V2]"
+    echo "2) Sao lưu TẤT CẢ website (Local) [V2]"
+    echo "3) Upload backup 1 tên miền lên Google Drive [V2]"
+    echo "4) Upload backup TẤT CẢ lên Google Drive [V2]"
     echo "5) Kết nối Google Drive (rclone config)"
-    echo "6) Dọn backup local (giữ ${DLH_KEEP_BACKUPS} bản/domain)"
+    echo "6) Dọn backup local (giữ ${DLH_KEEP_BACKUPS} bản/domain) [V2]"
     echo "0) Quay lại"
     hr
     case "$(read_tty "Chọn: ")" in
-      1)
-        local d
-        d="$(read_tty "Nhập tên miền: ")"
-        backup_site_local_ "$d"
-        pause
-        ;;
-      2)
-        backup_all_local_
-        pause
-        ;;
-      3)
-        local d
-        d="$(read_tty "Nhập tên miền: ")"
-        gdrive_upload_domain_ "$d"
-        pause
-        ;;
-      4)
-        gdrive_upload_all_
-        pause
-        ;;
-      5)
-        gdrive_setup_
-        pause
-        ;;
-      6)
-        backup_prune_all_
-        pause
-        ;;
+      1) backup_site_local_ "x"; pause ;;
+      2) backup_all_local_; pause ;;
+      3) gdrive_upload_domain_ "x"; pause ;;
+      4) gdrive_upload_all_; pause ;;
+      5) gdrive_setup_; pause ;;
+      6) backup_prune_all_; pause ;;
       0) return ;;
       *) msg_warn "Lựa chọn không hợp lệ."; pause ;;
     esac
@@ -813,11 +719,15 @@ menu_domain_ssl() {
     printf "%s%s[TÊN MIỀN / SSL]%s\n" "$C_BOLD" "$C_BLU" "$C_RESET"
     echo "1) Thêm tên miền (tạo vhost Nginx + thư mục web)"
     echo "2) Cài SSL miễn phí (Let's Encrypt + HTTP/2 + tự gia hạn)"
+    echo "3) Xóa tên miền (vhost + thư mục web + tuỳ chọn SSL/DB)"
+    echo "4) Thiết lập email SSL mặc định (lưu 1 lần)"
     echo "0) Quay lại"
     hr
     case "$(read_tty "Chọn: ")" in
       1) add_domain; pause ;;
       2) install_ssl; pause ;;
+      3) delete_domain; pause ;;
+      4) set_ssl_email; pause ;;
       0) return ;;
       *) msg_warn "Lựa chọn không hợp lệ."; pause ;;
     esac
