@@ -75,87 +75,6 @@ MYSQL_ADMIN_CNF="${MYSQL_ADMIN_CNF}"
 EOF
 }
 
-# -----------------------------
-# Danh sách domain / SSL
-# -----------------------------
-list_domains_() {
-  local -a domains=()
-  if [[ -d "$ROOT_BASE" ]]; then
-    while IFS= read -r -d '' d; do
-      domains+=("$(basename "$d")")
-    done < <(find "$ROOT_BASE" -mindepth 1 -maxdepth 1 -type d -print0 2>/dev/null || true)
-  fi
-
-  if [[ "${#domains[@]}" -eq 0 ]]; then
-    echo "  (chưa có domain nào trong ${ROOT_BASE})"
-    return 1
-  fi
-
-  local i=1
-  for d in "${domains[@]}"; do
-    printf "  %2d) %s\n" "$i" "$d"
-    i=$((i+1))
-  done
-  return 0
-}
-
-choose_domain_() {
-  # Trả về domain qua stdout. Return 1 nếu không chọn.
-  local prompt="${1:-Chọn domain}"
-  echo
-  echo "[DANH SÁCH DOMAIN]"
-  if ! list_domains_; then
-    echo
-    read_tty "Nhập domain (vd: example.com) (Enter để hủy): "
-    local d="${REPLY:-}"
-    [[ -n "$d" ]] && echo "$d" && return 0
-    return 1
-  fi
-
-  echo
-  read_tty "${prompt} (nhập số hoặc gõ domain, Enter để hủy): "
-  local ans="${REPLY:-}"
-  [[ -z "$ans" ]] && return 1
-
-  if [[ "$ans" =~ ^[0-9]+$ ]]; then
-    local idx="$ans"
-    local picked=""
-    picked="$(find "$ROOT_BASE" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' 2>/dev/null | sed -n "${idx}p" || true)"
-    [[ -n "$picked" ]] || { echo "[LỖI] Số không hợp lệ."; return 1; }
-    echo "$picked"
-    return 0
-  fi
-
-  echo "$ans"
-  return 0
-}
-
-list_ssl_domains_() {
-  echo
-  echo "[DANH SÁCH SSL (Let's Encrypt)]"
-  if [[ ! -d /etc/letsencrypt/renewal ]]; then
-    echo "  (chưa có chứng chỉ nào)"
-    return 0
-  fi
-  local found=0
-  for f in /etc/letsencrypt/renewal/*.conf; do
-    [[ -f "$f" ]] || continue
-    local line
-    line="$(grep -E '^[[:space:]]*domains[[:space:]]*=' "$f" 2>/dev/null | head -n1 || true)"
-    if [[ -n "$line" ]]; then
-      found=1
-      local certname
-      certname="$(basename "$f" .conf)"
-      # domains = a.com, www.a.com
-      local doms="${line#*=}"
-      doms="$(echo "$doms" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
-      printf "  - %s: %s\n" "$certname" "$doms"
-    fi
-  done
-  [[ "$found" -eq 1 ]] || echo "  (chưa có chứng chỉ nào)"
-}
-
-
 ensure_snippets() {
   mkdir -p /etc/nginx/snippets
   [[ -f /etc/nginx/snippets/dlh-block-sensitive.conf ]] || cat >/etc/nginx/snippets/dlh-block-sensitive.conf <<'EOF'
@@ -223,7 +142,7 @@ add_domain() {
   domain="${domain,,}"
   [[ -n "$domain" ]] || { msg_err "Tên miền trống."; return; }
 
-  local webroot="${ROOT_BASE}/${domain}/public_html"
+  local webroot="${ROOT_BASE}/${domain}/public"
   mkdir -p "$webroot"
   [[ -f "${webroot}/index.php" ]] || echo '<?php echo "OK"; ?>' > "${webroot}/index.php"
   chown -R www-data:www-data "${ROOT_BASE}/${domain}"
@@ -258,62 +177,39 @@ EOF
 
 install_ssl() {
   local domain email
-  domain="$(choose_domain_ "Cài SSL cho domain nào")" || return
+  domain="$(read_tty "Nhập tên miền để cài SSL (vd: example.com): ")"
   domain="${domain,,}"
-  domain="$(echo "$domain" | tr -d ' ')"
   [[ -n "$domain" ]] || { msg_err "Tên miền trống."; return; }
 
-  # Email mặc định: hỏi 1 lần, lưu lại
   if [[ -n "${SSL_EMAIL:-}" ]]; then
     email="$SSL_EMAIL"
     msg_ok "Dùng email SSL mặc định: ${email}"
   else
-    email="$(read_tty "Nhập email nhận thông báo SSL (lưu lại lần sau): ")" || true
-    email="${email:-}"
+    email="$(read_tty "Nhập email nhận thông báo SSL (lưu lại lần sau): ")"
     [[ -n "$email" ]] || { msg_err "Email trống."; return; }
     SSL_EMAIL="$email"
     save_conf
     msg_ok "Đã lưu email SSL mặc định."
   fi
 
-  apt_install_ certbot python3-certbot-nginx dnsutils
-
-  # Kiểm tra DNS www: ưu tiên dig @1.1.1.1 (chuẩn nhất), fallback getent
-  local has_www=0
-  if command -v dig >/dev/null 2>&1; then
-    local a4 a6
-    a4="$(dig +short A "www.${domain}" @1.1.1.1 2>/dev/null | head -n1 || true)"
-    a6="$(dig +short AAAA "www.${domain}" @1.1.1.1 2>/dev/null | head -n1 || true)"
-    [[ -n "$a4" || -n "$a6" ]] && has_www=1 || has_www=0
-  else
-    getent ahosts "www.${domain}" >/dev/null 2>&1 && has_www=1 || has_www=0
-  fi
+  apt_install_ certbot python3-certbot-nginx
 
   local args=(-d "$domain")
-  if [[ "$has_www" -eq 1 ]]; then
+  if getent ahosts "www.${domain}" >/dev/null 2>&1; then
     args+=(-d "www.${domain}")
-    msg_ok "DNS có www.${domain} -> sẽ xin SSL kèm www"
+    msg_ok "DNS có www.${domain} -> xin SSL kèm www"
   else
-    msg_warn "DNS thiếu www.${domain} -> chỉ xin SSL cho ${domain}"
+    msg_warn "DNS thiếu www.${domain} -> bỏ www"
   fi
 
-  # --expand để không hỏi Y/n khi đã có cert cũ
-  certbot --nginx "${args[@]}" --cert-name "$domain" --expand \
-    -m "$email" --agree-tos --non-interactive --redirect || {
-      msg_warn "Cài SSL thất bại. Hãy kiểm tra DNS/Cloudflare và đảm bảo port 80 truy cập được."
-      return
-    }
+  certbot --nginx "${args[@]}" --cert-name "$domain" --expand     -m "$email" --agree-tos --non-interactive --redirect
 
   systemctl enable --now certbot.timer || true
-
-  # Bật HTTP/2 cho server block SSL
-  sed -i 's/listen 443 ssl;/listen 443 ssl http2;/g' /etc/nginx/sites-enabled/*.conf 2>/dev/null || true
-  sed -i 's/listen \[::\]:443 ssl;/listen [::]:443 ssl http2;/g' /etc/nginx/sites-enabled/*.conf 2>/dev/null || true
-
-  nginx_test_reload_
-  msg_ok "Hoàn tất cài SSL (Let\'s Encrypt)."
+  sed -i 's/listen 443 ssl;/listen 443 ssl http2;/' /etc/nginx/sites-enabled/*.conf 2>/dev/null || true
+  sed -i 's/listen \[::\]:443 ssl;/listen [::]:443 ssl http2;/' /etc/nginx/sites-enabled/*.conf 2>/dev/null || true
+  nginx_reload
+  msg_ok "SSL OK: https://${domain}"
 }
-
 
 delete_domain() {
   local domain ans
@@ -382,8 +278,6 @@ menu_domain_ssl() {
     echo "2) Cài SSL"
     echo "3) Xóa tên miền"
     echo "4) Thiết lập email SSL mặc định"
-    echo "5) Danh sách domain đã thêm"
-    echo "6) Danh sách domain đang dùng SSL"
     echo "0) Quay lại"
     hr
     case "$(read_tty "Chọn: ")" in
@@ -391,8 +285,6 @@ menu_domain_ssl() {
       2) install_ssl; pause ;;
       3) delete_domain; pause ;;
       4) set_ssl_email; pause ;;
-      5) list_domains_; pause ;;
-      6) list_ssl_domains_; pause ;;
       0) return ;;
       *) msg_warn "Sai lựa chọn."; pause ;;
     esac

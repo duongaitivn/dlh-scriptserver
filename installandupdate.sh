@@ -142,34 +142,6 @@ ensure_nginx_php() {
 
 write_nginx_basics() {
 
-  # ensure antibot snippet exists (some older vhosts include basic-antibot.conf)
-  mkdir -p /etc/nginx/snippets
-  if [[ -f "/etc/nginx/snippets/dlh-basic-antibot.conf" && ! -f "/etc/nginx/snippets/dlh-basic-antibot.conf" ]]; then
-    # create a compatibility shim
-    cat > /etc/nginx/snippets/dlh-basic-antibot.conf <<'EOF'
-# DLH compat: keep old include path
-include /etc/nginx/snippets/dlh-basic-antibot.conf;
-EOF
-  fi
-
-  # migrate legacy snippets using old zone names (perip/login) -> dlh_perip/dlh_login
-  if [[ -d "/etc/nginx/snippets" ]]; then
-    for f in /etc/nginx/snippets/*.conf; do
-      [[ -f "$f" ]] || continue
-      # backup once per run if we will change
-      if grep -qE 'zone=(perip|login)\b' "$f" 2>/dev/null; then
-        cp -a "$f" "${f}.bak.$(date +%s)" || true
-        sed -i 's/zone=perip/zone=dlh_perip/g; s/zone=login/zone=dlh_login/g' "$f" || true
-      fi
-      # also handle uppercase variants
-      if grep -qE 'zone=(Perip|Login)\b' "$f" 2>/dev/null; then
-        cp -a "$f" "${f}.bak.$(date +%s)" || true
-        sed -i 's/zone=Perip/zone=dlh_perip/g; s/zone=Login/zone=dlh_login/g' "$f" || true
-      fi
-    done
-  fi
-
-
   # cleanup legacy server_tokens duplication (safe)
   local st_hits=""
   st_hits="$(grep -RInE '^[[:space:]]*server_tokens[[:space:]]' /etc/nginx/nginx.conf /etc/nginx/conf.d /etc/nginx/sites-enabled 2>/dev/null || true)"
@@ -240,8 +212,8 @@ gzip_types
 }
 
 write_default_site() {
-  mkdir -p "${DEFAULT_ROOT_BASE}/site/public_html"
-  [[ -f "${DEFAULT_ROOT_BASE}/site/public_html/index.php" ]] || write_file "${DEFAULT_ROOT_BASE}/site/public_html/index.php" "<?php echo 'OK';"
+  mkdir -p "${DEFAULT_ROOT_BASE}/site/public"
+  [[ -f "${DEFAULT_ROOT_BASE}/site/public/index.php" ]] || write_file "${DEFAULT_ROOT_BASE}/site/public/index.php" "<?php echo 'OK';"
   chown -R www-data:www-data "${DEFAULT_ROOT_BASE}/site"
 
   write_file "/etc/nginx/sites-available/site" \
@@ -249,7 +221,7 @@ write_default_site() {
   listen 80 default_server;
   listen [::]:80 default_server;
   server_name _;
-  root ${DEFAULT_ROOT_BASE}/site/public_html;
+  root ${DEFAULT_ROOT_BASE}/site/public;
   index index.php index.html;
 
   include /etc/nginx/snippets/dlh-block-sensitive.conf;
@@ -310,7 +282,6 @@ main() {
   ensure_nginx_php
 
   echo "[3/8] Nginx basics"
-  fix_legacy_nginx_zones_
   write_nginx_basics
 
   echo "[4/8] Default site (no domain)"
@@ -332,24 +303,6 @@ main() {
   echo "- Run menu: dlh"
   echo "- Update later: sudo dlh-update"
   echo "- Default webroot base: ${DEFAULT_ROOT_BASE}"
-}
-
-fix_legacy_nginx_zones_() {
-  # Dọn các file cũ gây lỗi trùng/zone perip/login
-  if [[ -f /etc/nginx/conf.d/10-limit-zones.conf && ! -f /etc/nginx/conf.d/10-limit-zones.conf.bak ]]; then
-    mv /etc/nginx/conf.d/10-limit-zones.conf /etc/nginx/conf.d/10-limit-zones.conf.bak.$(date +%s) || true
-  fi
-
-  if [[ -f /etc/nginx/snippets/dlh-basic-antibot.conf && ! -f /etc/nginx/snippets/dlh-basic-antibot.conf.bak ]]; then
-    mv /etc/nginx/snippets/dlh-basic-antibot.conf /etc/nginx/snippets/dlh-basic-antibot.conf.bak.$(date +%s) || true
-  fi
-
-  # Thay zone cũ trong các file include (nếu còn)
-  sed -i \
-    -e 's/zone=perip/zone=dlh_perip/g' \
-    -e 's/zone=login/zone=dlh_login/g' \
-    -e 's/limit_conn_zone[[:space:]]\+\$binary_remote_addr[[:space:]]\+zone=connperip/limit_conn_zone $binary_remote_addr zone=dlh_connperip/g' \
-    /etc/nginx/snippets/*.conf /etc/nginx/sites-available/*.conf /etc/nginx/sites-enabled/*.conf 2>/dev/null || true
 }
 
 main
