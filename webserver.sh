@@ -1,9 +1,27 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# =========================================================
+# DLH-Script V1 — Webserver Basic Installer (Ubuntu 24.04 / 1GB RAM)
+# - Nginx + PHP-FPM 8.3
+# - UFW + Fail2ban + Swap 2G
+# - gzip (skip if already enabled) + anti-bot + rate-limit zones
+# - logrotate
+# - Installs "dlh" menu (Vietnamese UI)
+# - Installs "webserver-update" to self-update from GitHub raw URL
+#
+# NOTE:
+# - Default webroot base: /home/www   (updated from /var/www)
+#
+# Run:
+#   curl -fsSL <RAW>/webserver.sh | sudo INSTALL_URL="<RAW>/webserver.sh" bash
+# =========================================================
+
 CONF="/etc/webserver-installer.conf"
 INSTALL_URL="${INSTALL_URL:-}"
 ZONE_CONN="dlh_connperip"
+
+DEFAULT_ROOT_BASE="/home/www"
 
 need_root() { [[ "${EUID}" -eq 0 ]] || { echo "ERROR: run with sudo"; exit 1; }; }
 
@@ -23,6 +41,7 @@ save_conf() {
   write_file "$CONF" \
 "INSTALL_URL=\"${INSTALL_URL}\"
 ZONE_CONN=\"${ZONE_CONN}\"
+DEFAULT_ROOT_BASE=\"${DEFAULT_ROOT_BASE}\"
 "
 }
 
@@ -53,7 +72,7 @@ bantime = 2h
 }
 
 ensure_swap_2g() {
-  swapon --show | grep -q '^/' && return
+  swapon --show | grep -q '^/' && return 0
   fallocate -l 2G /swapfile
   chmod 600 /swapfile
   mkswap /swapfile
@@ -163,16 +182,17 @@ location = /wp-login.php {
 }
 
 write_default_site_conf() {
-  mkdir -p /var/www/site/public
-  [[ -f /var/www/site/public/index.php ]] || write_file "/var/www/site/public/index.php" "<?php echo 'OK';"
-  chown -R www-data:www-data /var/www/site
+  # Default site (no domain) -> /home/www/site/public
+  mkdir -p "${DEFAULT_ROOT_BASE}/site/public"
+  [[ -f "${DEFAULT_ROOT_BASE}/site/public/index.php" ]] || write_file "${DEFAULT_ROOT_BASE}/site/public/index.php" "<?php echo 'OK';"
+  chown -R www-data:www-data "${DEFAULT_ROOT_BASE}/site"
 
   write_file "/etc/nginx/sites-available/site" \
 "server {
   listen 80 default_server;
   listen [::]:80 default_server;
   server_name _;
-  root /var/www/site/public;
+  root ${DEFAULT_ROOT_BASE}/site/public;
   index index.php index.html;
 
   include /etc/nginx/snippets/block-sensitive.conf;
@@ -233,12 +253,21 @@ echo \"Update done.\"
 }
 
 install_dlh_menu() {
-  #!/usr/bin/env bash
+  cat >/usr/local/bin/dlh <<'SH'
+#!/usr/bin/env bash
 set -euo pipefail
 
 CONF="/etc/dlh-menu.conf"
-ROOT_BASE_DEFAULT="/var/www"
+ROOT_BASE_DEFAULT="/home/www"
 PHP_SOCK="/run/php/php8.3-fpm.sock"
+
+# Backup V2 defaults
+DLH_KEEP_BACKUPS="${DLH_KEEP_BACKUPS:-3}"
+DLH_BACKUP_DIR="${DLH_BACKUP_DIR:-/var/backups/dlh}"
+DLH_MANIFEST="${DLH_MANIFEST:-/var/lib/dlh/manifest.json}"
+DLH_SECRETS_DIR="${DLH_SECRETS_DIR:-/var/lib/dlh/secrets}"
+DLH_RCLONE_REMOTE="${DLH_RCLONE_REMOTE:-gdrive}"
+DLH_GDRIVE_PATH="${DLH_GDRIVE_PATH:-DLH-Script/Backups}"
 
 is_tty() { [[ -t 1 ]]; }
 if is_tty; then
@@ -271,7 +300,7 @@ pause() { read_tty "Nhấn Enter để tiếp tục..."; }
 banner() {
   clear_screen
   printf "%s%sDLH-Script V1%s\n" "$C_BOLD" "$C_CYA" "$C_RESET"
-  printf "%sBộ công cụ webserver cơ bản (Nginx/PHP/SSL/WordPress)%s\n" "$C_DIM" "$C_RESET"
+  printf "%sBộ công cụ webserver cơ bản (Nginx/PHP/SSL/WordPress) - menu kiểu HOCVPS%s\n" "$C_DIM" "$C_RESET"
   hr
 }
 
@@ -317,6 +346,232 @@ limit_conn ${ZONE_CONN} 20;
 location = /xmlrpc.php { deny all; }
 location = /wp-login.php { try_files \$uri \$uri/ /index.php?\$args; }
 EOF
+}
+
+# =========================
+# BACKUP V2 (LOCAL + GDRIVE)
+# =========================
+ensure_tools_backup_() {
+  apt-get update -y
+  apt-get install -y tar gzip coreutils findutils jq mariadb-client >/dev/null 2>&1 || true
+}
+
+ensure_rclone_() {
+  if command -v rclone >/dev/null 2>&1; then return 0; fi
+  apt-get update -y
+  apt-get install -y rclone >/dev/null 2>&1 || {
+    msg_err "Không cài được rclone từ apt. Hãy thử: sudo apt-get install rclone"
+    return 1
+  }
+}
+
+rclone_remote_ready_() {
+  command -v rclone >/dev/null 2>&1 || return 1
+  rclone listremotes 2>/dev/null | grep -qx "${DLH_RCLONE_REMOTE}:"
+}
+
+gdrive_setup_() {
+  ensure_rclone_ || return 1
+  msg_warn "Sẽ mở cấu hình rclone. Bạn cần đăng nhập Google Drive 1 lần để cấp quyền."
+  msg_warn "Sau khi xong, remote phải có tên: ${DLH_RCLONE_REMOTE}:"
+  rclone config
+  if rclone_remote_ready_; then
+    msg_ok "Đã kết nối Google Drive: ${DLH_RCLONE_REMOTE}:"
+  else
+    msg_warn "Chưa thấy remote ${DLH_RCLONE_REMOTE}: . Bạn hãy kiểm tra lại trong rclone config."
+  fi
+}
+
+manifest_exists_() { [[ -f "$DLH_MANIFEST" ]] && [[ -s "$DLH_MANIFEST" ]]; }
+
+list_domains_from_manifest_() { jq -r '.sites[]?.domain // empty' "$DLH_MANIFEST" 2>/dev/null; }
+
+get_site_json_() {
+  local domain="$1"
+  jq -c --arg d "$domain" '.sites[]? | select(.domain==$d)' "$DLH_MANIFEST" 2>/dev/null || true
+}
+
+safe_domain_() {
+  local d="$1"
+  echo "$d" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9\.\-]//g'
+}
+
+backup_prune_local_() {
+  local domain="$1"
+  local keep="${2:-$DLH_KEEP_BACKUPS}"
+  local d; d="$(safe_domain_ "$domain")"
+  local base="${DLH_BACKUP_DIR}/${d}"
+  [[ -d "$base" ]] || return 0
+  local to_delete
+  to_delete="$(ls -1dt "${base}/"*/ 2>/dev/null | tail -n +"$((keep+1))" || true)"
+  if [[ -n "$to_delete" ]]; then
+    echo "$to_delete" | while IFS= read -r p; do rm -rf "$p" || true; done
+  fi
+}
+
+backup_site_local_() {
+  ensure_tools_backup_ || true
+
+  local domain="$1"
+  domain="$(safe_domain_ "$domain")"
+  [[ -n "$domain" ]] || { msg_err "Tên miền trống."; return 1; }
+
+  if ! manifest_exists_; then
+    msg_err "Chưa có manifest: ${DLH_MANIFEST}"
+    msg_warn "V2 cần manifest để biết webroot/db. Hãy tạo site bằng Wizard V2 trước."
+    return 1
+  fi
+
+  local site; site="$(get_site_json_ "$domain")"
+  if [[ -z "$site" ]]; then
+    msg_err "Không tìm thấy domain trong manifest: $domain"
+    return 1
+  fi
+
+  local webroot db_name db_user
+  webroot="$(echo "$site" | jq -r '.webroot // empty')"
+  db_name="$(echo "$site" | jq -r '.db_name // empty')"
+  db_user="$(echo "$site" | jq -r '.db_user // empty')"
+
+  [[ -d "$webroot" ]] || { msg_err "Không thấy webroot: $webroot"; return 1; }
+
+  local ts outdir
+  ts="$(date +"%Y%m%d-%H%M%S")"
+  outdir="${DLH_BACKUP_DIR}/${domain}/${ts}"
+  mkdir -p "$outdir"
+
+  local files_tar="${outdir}/${domain}-files.tar.gz"
+  msg_ok "Đang sao lưu FILES: $webroot"
+  tar -czf "$files_tar" \
+    --warning=no-file-changed \
+    --exclude='wp-content/cache' \
+    --exclude='wp-content/uploads/cache' \
+    --exclude='wp-content/upgrade' \
+    --exclude='*.log' \
+    -C "$webroot" . || { msg_err "Sao lưu FILES thất bại."; return 1; }
+
+  if [[ -n "$db_name" ]]; then
+    local passfile="${DLH_SECRETS_DIR}/${domain}.dbpass"
+    local db_sql="${outdir}/${domain}-db.sql.gz"
+
+    if [[ -f "$passfile" ]] && [[ -n "$db_user" ]]; then
+      msg_ok "Đang sao lưu DB: $db_name"
+      local db_pass; db_pass="$(cat "$passfile" 2>/dev/null || true)"
+      if [[ -n "$db_pass" ]]; then
+        mysqldump --single-transaction --quick --routines --triggers \
+          -u"$db_user" -p"$db_pass" "$db_name" 2>/dev/null \
+          | gzip -c > "$db_sql" || msg_warn "Sao lưu DB thất bại (check user/pass/db)."
+      else
+        msg_warn "Không đọc được DB password: $passfile"
+      fi
+    else
+      msg_warn "Thiếu DB info hoặc passfile, bỏ qua sao lưu DB. (db_user=$db_user passfile=$passfile)"
+    fi
+  else
+    msg_warn "Manifest không có db_name -> bỏ qua sao lưu DB."
+  fi
+
+  cat > "${outdir}/meta.txt" <<EOF
+domain=${domain}
+timestamp=${ts}
+webroot=${webroot}
+db_name=${db_name}
+db_user=${db_user}
+keep_local=${DLH_KEEP_BACKUPS}
+EOF
+
+  backup_prune_local_ "$domain" "$DLH_KEEP_BACKUPS"
+  msg_ok "Sao lưu local xong: ${outdir}"
+}
+
+backup_all_local_() {
+  if ! manifest_exists_; then
+    msg_err "Chưa có manifest: ${DLH_MANIFEST}"
+    return 1
+  fi
+
+  local domains; domains="$(list_domains_from_manifest_ || true)"
+  if [[ -z "$domains" ]]; then
+    msg_warn "Manifest rỗng, không có site để sao lưu."
+    return 0
+  fi
+
+  echo "$domains" | while IFS= read -r d; do
+    [[ -n "$d" ]] || continue
+    banner
+    msg_ok "Sao lưu ALL - đang xử lý: $d"
+    backup_site_local_ "$d" || msg_warn "Sao lưu thất bại: $d"
+  done
+  msg_ok "Sao lưu ALL local hoàn tất."
+}
+
+gdrive_upload_domain_() {
+  local domain="$1"
+  domain="$(safe_domain_ "$domain")"
+  [[ -n "$domain" ]] || { msg_err "Tên miền trống."; return 1; }
+
+  ensure_rclone_ || return 1
+  if ! rclone_remote_ready_; then
+    msg_warn "Chưa kết nối Google Drive (remote '${DLH_RCLONE_REMOTE}:' chưa tồn tại)."
+    msg_warn "Hãy vào menu: Sao lưu/Backup -> Kết nối Google Drive (rclone config)"
+    return 1
+  fi
+
+  local src="${DLH_BACKUP_DIR}/${domain}"
+  [[ -d "$src" ]] || { msg_err "Không có backup local cho domain: $domain"; return 1; }
+
+  local dst="${DLH_RCLONE_REMOTE}:${DLH_GDRIVE_PATH}/${domain}"
+  msg_ok "Đang upload lên Google Drive: ${dst}"
+  rclone copy "$src" "$dst" \
+    --create-empty-src-dirs \
+    --transfers 2 --checkers 4 \
+    --retries 3 --low-level-retries 10 \
+    --stats 10s || { msg_err "Upload thất bại."; return 1; }
+  msg_ok "Upload xong: ${domain}"
+}
+
+gdrive_upload_all_() {
+  ensure_rclone_ || return 1
+  if ! rclone_remote_ready_; then
+    msg_warn "Chưa kết nối Google Drive (remote '${DLH_RCLONE_REMOTE}:' chưa tồn tại)."
+    msg_warn "Hãy vào menu: Sao lưu/Backup -> Kết nối Google Drive (rclone config)"
+    return 1
+  fi
+
+  if ! manifest_exists_; then
+    msg_err "Chưa có manifest: ${DLH_MANIFEST}"
+    return 1
+  fi
+
+  local domains; domains="$(list_domains_from_manifest_ || true)"
+  if [[ -z "$domains" ]]; then
+    msg_warn "Manifest rỗng, không có site để upload."
+    return 0
+  fi
+
+  echo "$domains" | while IFS= read -r d; do
+    [[ -n "$d" ]] || continue
+    banner
+    msg_ok "Upload ALL - đang xử lý: $d"
+    gdrive_upload_domain_ "$d" || msg_warn "Upload thất bại: $d"
+    pause
+  done
+  msg_ok "Upload ALL lên Google Drive hoàn tất."
+}
+
+backup_prune_all_() {
+  if ! manifest_exists_; then
+    msg_err "Chưa có manifest: ${DLH_MANIFEST}"
+    return 1
+  fi
+  local domains; domains="$(list_domains_from_manifest_ || true)"
+  [[ -n "$domains" ]] || { msg_warn "Manifest rỗng."; return 0; }
+
+  echo "$domains" | while IFS= read -r d; do
+    [[ -n "$d" ]] || continue
+    backup_prune_local_ "$d" "$DLH_KEEP_BACKUPS"
+  done
+  msg_ok "Đã dọn local backup (giữ ${DLH_KEEP_BACKUPS} bản/domain)."
 }
 
 # ---------- Actions ----------
@@ -372,7 +627,6 @@ install_ssl() {
   apt-get update -y
   apt-get install -y certbot python3-certbot-nginx
 
-  # AUTO: nếu www có DNS thì thêm, thiếu thì tự bỏ (không hỏi Y/N)
   local args=(-d "$domain")
   if getent ahosts "www.${domain}" >/dev/null 2>&1; then
     args+=(-d "www.${domain}")
@@ -388,7 +642,6 @@ install_ssl() {
 
   systemctl enable --now certbot.timer || true
 
-  # best-effort enable HTTP/2
   sed -i 's/listen 443 ssl;/listen 443 ssl http2;/' /etc/nginx/sites-enabled/*.conf 2>/dev/null || true
   sed -i 's/listen \[::\]:443 ssl;/listen [::]:443 ssl http2;/' /etc/nginx/sites-enabled/*.conf 2>/dev/null || true
 
@@ -456,6 +709,53 @@ wp_menu() {
       1) install_wpcli; pause ;;
       2) wp_download; pause ;;
       3) wp_fixperm; pause ;;
+      0) return ;;
+      *) msg_warn "Lựa chọn không hợp lệ."; pause ;;
+    esac
+  done
+}
+
+menu_backup() {
+  while true; do
+    banner
+    printf "%s%s[SAO LƯU / BACKUP]%s\n" "$C_BOLD" "$C_BLU" "$C_RESET"
+    echo "1) Sao lưu 1 website theo tên miền (Local)"
+    echo "2) Sao lưu TẤT CẢ website (Local)"
+    echo "3) Upload backup 1 tên miền lên Google Drive"
+    echo "4) Upload backup TẤT CẢ lên Google Drive"
+    echo "5) Kết nối Google Drive (rclone config)"
+    echo "6) Dọn backup local (giữ ${DLH_KEEP_BACKUPS} bản/domain)"
+    echo "0) Quay lại"
+    hr
+    case "$(read_tty "Chọn: ")" in
+      1)
+        local d
+        d="$(read_tty "Nhập tên miền: ")"
+        backup_site_local_ "$d"
+        pause
+        ;;
+      2)
+        backup_all_local_
+        pause
+        ;;
+      3)
+        local d
+        d="$(read_tty "Nhập tên miền: ")"
+        gdrive_upload_domain_ "$d"
+        pause
+        ;;
+      4)
+        gdrive_upload_all_
+        pause
+        ;;
+      5)
+        gdrive_setup_
+        pause
+        ;;
+      6)
+        backup_prune_all_
+        pause
+        ;;
       0) return ;;
       *) msg_warn "Lựa chọn không hợp lệ."; pause ;;
     esac
@@ -546,13 +846,15 @@ main_menu() {
     banner
     echo "1) Tên miền / SSL"
     echo "2) Tiện ích WordPress"
-    echo "3) Hệ thống / Công cụ"
+    echo "3) Sao lưu / Backup"
+    echo "4) Hệ thống / Công cụ"
     echo "0) Thoát"
     hr
     case "$(read_tty "Chọn: ")" in
       1) menu_domain_ssl ;;
       2) wp_menu ;;
-      3) menu_system ;;
+      3) menu_backup ;;
+      4) menu_system ;;
       0) exit 0 ;;
       *) msg_warn "Lựa chọn không hợp lệ."; pause ;;
     esac
@@ -561,7 +863,7 @@ main_menu() {
 
 load_conf
 main_menu
-
+SH
   chmod +x /usr/local/bin/dlh
 }
 
@@ -594,6 +896,7 @@ main() {
   echo "DONE ✅"
   echo "- Run menu: dlh"
   echo "- Update later: sudo webserver-update"
+
 }
 
 main
