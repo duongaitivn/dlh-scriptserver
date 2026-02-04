@@ -20,7 +20,6 @@ set -euo pipefail
 CONF="/etc/webserver-installer.conf"
 INSTALL_URL="${INSTALL_URL:-}"
 ZONE_CONN="dlh_connperip"
-
 DEFAULT_ROOT_BASE="/home/www"
 
 need_root() { [[ "${EUID}" -eq 0 ]] || { echo "ERROR: run with sudo"; exit 1; }; }
@@ -107,7 +106,6 @@ gzip_already_enabled_elsewhere() {
   [[ -n "$hits" ]]
 }
 
-# Must NOT exit when file doesn't exist under "set -e"
 disable_our_gzip_conf() {
   if [[ -f /etc/nginx/conf.d/01-gzip.conf ]]; then
     mv /etc/nginx/conf.d/01-gzip.conf /etc/nginx/conf.d/01-gzip.conf.off
@@ -182,7 +180,6 @@ location = /wp-login.php {
 }
 
 write_default_site_conf() {
-  # Default site (no domain) -> /home/www/site/public
   mkdir -p "${DEFAULT_ROOT_BASE}/site/public"
   [[ -f "${DEFAULT_ROOT_BASE}/site/public/index.php" ]] || write_file "${DEFAULT_ROOT_BASE}/site/public/index.php" "<?php echo 'OK';"
   chown -R www-data:www-data "${DEFAULT_ROOT_BASE}/site"
@@ -261,7 +258,6 @@ CONF="/etc/dlh-menu.conf"
 ROOT_BASE_DEFAULT="/home/www"
 PHP_SOCK="/run/php/php8.3-fpm.sock"
 
-# Backup V2 defaults
 DLH_KEEP_BACKUPS="${DLH_KEEP_BACKUPS:-3}"
 DLH_BACKUP_DIR="${DLH_BACKUP_DIR:-/var/backups/dlh}"
 DLH_MANIFEST="${DLH_MANIFEST:-/var/lib/dlh/manifest.json}"
@@ -308,7 +304,6 @@ msg_ok()   { printf "%s[OK]%s %s\n"   "$C_GRN" "$C_RESET" "$*"; }
 msg_warn() { printf "%s[CẢNH BÁO]%s %s\n" "$C_YEL" "$C_RESET" "$*"; }
 msg_err()  { printf "%s[LỖI]%s %s\n"  "$C_RED" "$C_RESET" "$*"; }
 
-# auto sudo
 if [[ "${EUID}" -ne 0 ]]; then
   exec sudo -E "$0" "$@"
 fi
@@ -348,9 +343,6 @@ location = /wp-login.php { try_files \$uri \$uri/ /index.php?\$args; }
 EOF
 }
 
-# =========================
-# BACKUP V2 (LOCAL + GDRIVE)
-# =========================
 ensure_tools_backup_() {
   apt-get update -y
   apt-get install -y tar gzip coreutils findutils jq mariadb-client >/dev/null 2>&1 || true
@@ -575,7 +567,6 @@ backup_prune_all_() {
   msg_ok "Đã dọn local backup (giữ ${DLH_KEEP_BACKUPS} bản/domain)."
 }
 
-# ---------- Actions ----------
 add_domain() {
   ensure_snippets
   local domain
@@ -636,7 +627,10 @@ install_ssl() {
     msg_warn "DNS thiếu www.${domain} (NXDOMAIN) -> bỏ www, chỉ xin SSL cho ${domain}"
   fi
 
-  if ! certbot --nginx "${args[@]}" -m "$email" --agree-tos --non-interactive --redirect; then
+  if ! certbot --nginx "${args[@]}" \
+    --cert-name "$domain" \
+    --expand \
+    -m "$email" --agree-tos --non-interactive --redirect; then
     msg_warn "Cài SSL thất bại. Kiểm tra DNS/Cloudflare và đảm bảo port 80 truy cập được."
     return
   fi
