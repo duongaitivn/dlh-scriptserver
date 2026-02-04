@@ -58,7 +58,7 @@ if [[ -z "${INSTALL_URL:-}" ]]; then
   echo "  curl -fsSL <raw>/installandupdate.sh | sudo INSTALL_URL=\"<raw>/installandupdate.sh\" bash"
   exit 1
 fi
-curl -fsSL "$INSTALL_URL" | sudo INSTALL_URL="$INSTALL_URL" bash
+curl -fsSL -H "Cache-Control: no-cache" "${INSTALL_URL}?v=$(date +%s)" | sudo INSTALL_URL="$INSTALL_URL" bash
 echo "Update done."
 '
   chmod +x /usr/local/bin/dlh-update

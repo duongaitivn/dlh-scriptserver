@@ -39,6 +39,33 @@ read_tty() {
   fi
   printf "%s" "$var"
 }
+
+
+has_dns_record_() {
+  # usage: has_dns_record_ <fqdn>
+  local fqdn="$1"
+  # Prefer dig with public resolver to avoid local resolver quirks/caching
+  if command -v dig >/dev/null 2>&1; then
+    local out
+    out="$(dig +time=2 +tries=1 +short A "$fqdn" @1.1.1.1 2>/dev/null | head -n 1)"
+    [[ -n "$out" ]] && return 0
+    out="$(dig +time=2 +tries=1 +short AAAA "$fqdn" @1.1.1.1 2>/dev/null | head -n 1)"
+    [[ -n "$out" ]] && return 0
+    # fallback resolver
+    out="$(dig +time=2 +tries=1 +short A "$fqdn" @8.8.8.8 2>/dev/null | head -n 1)"
+    [[ -n "$out" ]] && return 0
+    out="$(dig +time=2 +tries=1 +short AAAA "$fqdn" @8.8.8.8 2>/dev/null | head -n 1)"
+    [[ -n "$out" ]] && return 0
+    return 1
+  fi
+
+  # Fallback: getent ahosts (may be affected by local NSS, but better than nothing)
+  if command -v getent >/dev/null 2>&1; then
+    getent ahosts "$fqdn" 2>/dev/null | awk '{print $1}' | head -n 1 | grep -qE '^[0-9a-fA-F:.]+$' && return 0
+  fi
+  return 1
+}
+
 pause() { read_tty "Nhấn Enter để tiếp tục..."; }
 
 banner() {
@@ -176,6 +203,7 @@ EOF
 }
 
 install_ssl() {
+  # SSL: auto www check
   local domain email
   domain="$(read_tty "Nhập tên miền để cài SSL (vd: example.com): ")"
   domain="${domain,,}"
@@ -197,8 +225,7 @@ install_ssl() {
   local args=(-d "$domain")
   if getent ahosts "www.${domain}" >/dev/null 2>&1; then
     args+=(-d "www.${domain}")
-    msg_ok "DNS có www.${domain} -> xin SSL kèm www"
-  else
+      else
     msg_warn "DNS thiếu www.${domain} -> bỏ www"
   fi
 
