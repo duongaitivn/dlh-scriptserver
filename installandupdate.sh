@@ -1,6 +1,19 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# =========================================================
+# DLH-Script V2 — install + update (Ubuntu 24.04, VPS nhỏ)
+# Repo structure (2 files):
+#   - installandupdate.sh   (this file)
+#   - dlh-script.sh         (menu; installed as /usr/local/bin/dlh)
+#
+# Install:
+#   curl -fsSL <RAW>/installandupdate.sh | sudo INSTALL_URL="<RAW>/installandupdate.sh" bash
+#
+# Update later:
+#   sudo dlh-update
+# =========================================================
+
 CONF="/etc/dlh-installer.conf"
 DEFAULT_ROOT_BASE="/home/www"
 ZONE_CONN="dlh_connperip"
