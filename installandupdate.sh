@@ -142,6 +142,24 @@ ensure_nginx_php() {
 
 write_nginx_basics() {
 
+  # migrate legacy snippets using old zone names (perip/login) -> dlh_perip/dlh_login
+  if [[ -d "/etc/nginx/snippets" ]]; then
+    for f in /etc/nginx/snippets/*.conf; do
+      [[ -f "$f" ]] || continue
+      # backup once per run if we will change
+      if grep -qE 'zone=(perip|login)\b' "$f" 2>/dev/null; then
+        cp -a "$f" "${f}.bak.$(date +%s)" || true
+        sed -i 's/zone=perip/zone=dlh_perip/g; s/zone=login/zone=dlh_login/g' "$f" || true
+      fi
+      # also handle uppercase variants
+      if grep -qE 'zone=(Perip|Login)\b' "$f" 2>/dev/null; then
+        cp -a "$f" "${f}.bak.$(date +%s)" || true
+        sed -i 's/zone=Perip/zone=dlh_perip/g; s/zone=Login/zone=dlh_login/g' "$f" || true
+      fi
+    done
+  fi
+
+
   # cleanup legacy server_tokens duplication (safe)
   local st_hits=""
   st_hits="$(grep -RInE '^[[:space:]]*server_tokens[[:space:]]' /etc/nginx/nginx.conf /etc/nginx/conf.d /etc/nginx/sites-enabled 2>/dev/null || true)"
