@@ -142,6 +142,16 @@ ensure_nginx_php() {
 
 write_nginx_basics() {
 
+  # ensure antibot snippet exists (some older vhosts include basic-antibot.conf)
+  mkdir -p /etc/nginx/snippets
+  if [[ -f "/etc/nginx/snippets/dlh-basic-antibot.conf" && ! -f "/etc/nginx/snippets/dlh-basic-antibot.conf" ]]; then
+    # create a compatibility shim
+    cat > /etc/nginx/snippets/dlh-basic-antibot.conf <<'EOF'
+# DLH compat: keep old include path
+include /etc/nginx/snippets/dlh-basic-antibot.conf;
+EOF
+  fi
+
   # migrate legacy snippets using old zone names (perip/login) -> dlh_perip/dlh_login
   if [[ -d "/etc/nginx/snippets" ]]; then
     for f in /etc/nginx/snippets/*.conf; do
@@ -330,8 +340,8 @@ fix_legacy_nginx_zones_() {
     mv /etc/nginx/conf.d/10-limit-zones.conf /etc/nginx/conf.d/10-limit-zones.conf.bak.$(date +%s) || true
   fi
 
-  if [[ -f /etc/nginx/snippets/basic-antibot.conf && ! -f /etc/nginx/snippets/basic-antibot.conf.bak ]]; then
-    mv /etc/nginx/snippets/basic-antibot.conf /etc/nginx/snippets/basic-antibot.conf.bak.$(date +%s) || true
+  if [[ -f /etc/nginx/snippets/dlh-basic-antibot.conf && ! -f /etc/nginx/snippets/dlh-basic-antibot.conf.bak ]]; then
+    mv /etc/nginx/snippets/dlh-basic-antibot.conf /etc/nginx/snippets/dlh-basic-antibot.conf.bak.$(date +%s) || true
   fi
 
   # Thay zone cũ trong các file include (nếu còn)
