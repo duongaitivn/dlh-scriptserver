@@ -1,333 +1,40 @@
 #!/usr/bin/env bash
 set -euo pipefail
-
-# =========================================================
-# DLH-Script V2 — install + update (Ubuntu 24.04, VPS nhỏ)
-# Repo structure (2 files):
-#   - installandupdate.sh   (this file)
-#   - dlh-script.sh         (menu; installed as /usr/local/bin/dlh)
-#
-# Install:
-#   curl -fsSL <RAW>/installandupdate.sh | sudo INSTALL_URL="<RAW>/installandupdate.sh" bash
-#
-# Update later:
-#   sudo dlh-update
-# =========================================================
-
-CONF="/etc/dlh-installer.conf"
-DEFAULT_ROOT_BASE="/home/www"
-ZONE_CONN="dlh_connperip"
-INSTALL_URL="${INSTALL_URL:-}"
-
-need_root() { [[ "${EUID}" -eq 0 ]] || { echo "ERROR: run with sudo"; exit 1; }; }
-
-ensure_apt_ipv4() {
-  mkdir -p /etc/apt/apt.conf.d
-  printf 'Acquire::ForceIPv4 "true";\n' > /etc/apt/apt.conf.d/99force-ipv4
+DEFAULT_INSTALL_URL="https://raw.githubusercontent.com/duongaitivn/dlh-scriptserver/main/dlh-script.sh"
+CONFIG_DIR="/etc/dlh-script"
+CONFIG_FILE="${CONFIG_DIR}/config.env"
+BIN="/usr/local/bin/dlh-script"
+LINK_BIN="/usr/local/bin/dlh"
+say(){ echo -e "$*"; }
+die(){ echo -e "[LỖI] $*" >&2; exit 1; }
+need_root(){ [[ "${EUID:-$(id -u)}" -eq 0 ]] || die "Hãy chạy: sudo bash $0"; }
+ensure_dirs(){ mkdir -p "$CONFIG_DIR"; touch "$CONFIG_FILE"; chmod 600 "$CONFIG_FILE"; }
+get_cfg(){ local k="$1"; [[ -f "$CONFIG_FILE" ]] && source "$CONFIG_FILE" || true; eval "echo \"\${$k:-}\"" ; }
+set_cfg(){ local k="$1" v="$2"; mkdir -p "$CONFIG_DIR"; touch "$CONFIG_FILE"; chmod 600 "$CONFIG_FILE";
+  if grep -qE "^${k}=" "$CONFIG_FILE"; then sed -i "s|^${k}=.*|${k}=$(printf %q "$v")|g" "$CONFIG_FILE";
+  else printf "%s=%q\n" "$k" "$v" >> "$CONFIG_FILE"; fi; }
+force_ipv4_apt(){ mkdir -p /etc/apt/apt.conf.d; cat >/etc/apt/apt.conf.d/99force-ipv4 <<'EOF'
+Acquire::ForceIPv4 "true";
+EOF
 }
-
-apt_install() {
-  export DEBIAN_FRONTEND=noninteractive
-  ensure_apt_ipv4
-  apt-get update -y
-  apt-get install -y "$@"
+curl4(){ curl -4 -fL --connect-timeout 15 --max-time 600 -sS "$@"; }
+pick_install_url(){
+  local cur; cur="$(get_cfg INSTALL_URL)";
+  if [[ -n "$cur" ]]; then say "[OK] INSTALL_URL hiện tại: $cur"; echo "$cur"; return; fi
+  say "Nhập INSTALL_URL (Enter để dùng mặc định):"; say "  Mặc định: $DEFAULT_INSTALL_URL";
+  read -r url || true; url="${url:-$DEFAULT_INSTALL_URL}";
+  set_cfg INSTALL_URL "$url"; say "[OK] Đã lưu INSTALL_URL: $url"; echo "$url";
 }
-
-write_file() {
-  local path="$1" content="$2"
-  mkdir -p "$(dirname "$path")"
-  printf "%s" "$content" > "$path"
+download_menu(){
+  local url="$1"; say "[...] Tải dlh-script từ: $url";
+  local tmp="/tmp/dlh-script.$RANDOM.sh"; curl4 "$url" >"$tmp" || die "Không tải được INSTALL_URL.";
+  head -n 3 "$tmp" | grep -qE '^#!/usr/bin/env bash' || die "File tải về không phải bash script.";
+  install -m 0755 "$tmp" "$BIN"; rm -f "$tmp"; ln -sf "$BIN" "$LINK_BIN";
+  say "[OK] Đã cài: $BIN"; say "[OK] Lệnh menu: dlh";
 }
-
-cleanup_legacy_nginx_confs() {
-  # Fix old runs that wrote gzip directives into security conf -> causes "duplicate" errors
-  local f="/etc/nginx/conf.d/00-dlh-security.conf"
-  if [[ -f "$f" ]] && grep -qiE '^\s*gzip(_[a-z_]+)?\s' "$f"; then
-    log "[FIX] Loại bỏ các dòng gzip* cũ trong $f (tránh lỗi duplicate)"
-    # remove any gzip* directives from this file
-    sed -i -E '/^\s*gzip([_a-zA-Z0-9]+)?\s/d' "$f" || true
-  fi
-
-  # Fix old antibot snippet name used by earlier versions
-  local old_snip="/etc/nginx/snippets/basic-antibot.conf"
-  local new_snip="/etc/nginx/snippets/dlh-basic-antibot.conf"
-  if [[ -f "$old_snip" ]] && [[ ! -f "$new_snip" ]]; then
-    log "[FIX] Đổi tên snippet $old_snip -> $new_snip"
-    mv "$old_snip" "$new_snip" || true
-  fi
-
-  # Ensure any vhost includes point to the new snippet path
-  if [[ -f "$new_snip" ]]; then
-    sed -i -E 's|/etc/nginx/snippets/basic-antibot\.conf|/etc/nginx/snippets/dlh-basic-antibot.conf|g' /etc/nginx/sites-enabled/*.conf 2>/dev/null || true
-  fi
+main(){
+  need_root; ensure_dirs; force_ipv4_apt;
+  local url; url="$(pick_install_url)"; download_menu "$url";
+  say; say "DLH-Script V2 — OK. Gõ: dlh"; say;
 }
-
-save_conf() {
-  write_file "$CONF" \
-"INSTALL_URL=\"${INSTALL_URL}\"
-DEFAULT_ROOT_BASE=\"${DEFAULT_ROOT_BASE}\"
-ZONE_CONN=\"${ZONE_CONN}\"
-"
-}
-
-install_update_cmd() {
-  write_file "/usr/local/bin/dlh-update" \
-'#!/usr/bin/env bash
-set -euo pipefail
-source /etc/dlh-installer.conf || true
-if [[ -z "${INSTALL_URL:-}" ]]; then
-  echo "INSTALL_URL is empty."
-  echo "Run once with:"
-  echo "  curl -fsSL <raw>/installandupdate.sh | sudo INSTALL_URL=\"<raw>/installandupdate.sh\" bash"
-  exit 1
-fi
-curl -fsSL "$INSTALL_URL" | sudo INSTALL_URL="$INSTALL_URL" bash
-echo "Update done."
-'
-  chmod +x /usr/local/bin/dlh-update
-}
-
-install_menu_from_repo() {
-  if [[ -z "${INSTALL_URL}" ]]; then
-    echo "ERROR: INSTALL_URL is empty (need raw GitHub URL)."
-    exit 1
-  fi
-
-  local base_url menu_url
-  base_url="$(dirname "$INSTALL_URL")"
-  menu_url="${base_url}/dlh-script.sh"
-
-  mkdir -p /usr/local/bin
-  apt_install curl ca-certificates
-
-  if ! curl -fsSL "$menu_url" -o /usr/local/bin/dlh; then
-    echo "ERROR: cannot download dlh-script.sh from: $menu_url"
-    echo "Ensure repo has dlh-script.sh next to installandupdate.sh"
-    exit 1
-  fi
-  chmod +x /usr/local/bin/dlh
-}
-
-ensure_ufw() {
-  command -v ufw >/dev/null 2>&1 || apt_install ufw
-  ufw default deny incoming || true
-  ufw default allow outgoing || true
-  ufw allow OpenSSH || true
-  ufw allow 80/tcp || true
-  ufw allow 443/tcp || true
-  ufw --force enable || true
-}
-
-ensure_fail2ban() {
-  command -v fail2ban-client >/dev/null 2>&1 || apt_install fail2ban
-  systemctl enable --now fail2ban
-
-  if [[ ! -f /etc/fail2ban/jail.local ]]; then
-    write_file "/etc/fail2ban/jail.local" \
-"[sshd]
-enabled = true
-maxretry = 5
-findtime = 10m
-bantime = 2h
-"
-  fi
-  systemctl restart fail2ban
-}
-
-ensure_swap_2g() {
-  swapon --show | grep -q '^/' && return 0
-  fallocate -l 2G /swapfile
-  chmod 600 /swapfile
-  mkswap /swapfile
-  swapon /swapfile
-  grep -q '^/swapfile' /etc/fstab || echo '/swapfile none swap sw 0 0' >> /etc/fstab
-  write_file "/etc/sysctl.d/99-swappiness.conf" "vm.swappiness=10
-"
-  sysctl -p /etc/sysctl.d/99-swappiness.conf >/dev/null || true
-}
-
-ensure_nginx_php() {
-  apt_install nginx
-  apt_install php-fpm php-cli php-mysql php-curl php-mbstring php-xml php-zip php-gd php-intl
-  systemctl enable --now nginx
-  systemctl enable --now php8.3-fpm
-
-  # PHP-FPM tune for 1GB
-  local pool="/etc/php/8.3/fpm/pool.d/www.conf"
-  if [[ -f "$pool" ]]; then
-    sed -i 's/^pm = .*/pm = ondemand/' "$pool" || true
-    sed -i 's/^;*pm\.max_children = .*/pm.max_children = 8/' "$pool" || true
-    sed -i 's/^;*pm\.process_idle_timeout = .*/pm.process_idle_timeout = 10s/' "$pool" || true
-    sed -i 's/^;*pm\.max_requests = .*/pm.max_requests = 300/' "$pool" || true
-  fi
-  systemctl restart php8.3-fpm
-}
-
-write_nginx_basics() {
-
-  # cleanup legacy server_tokens duplication (safe)
-  local st_hits=""
-  st_hits="$(grep -RInE '^[[:space:]]*server_tokens[[:space:]]' /etc/nginx/nginx.conf /etc/nginx/conf.d /etc/nginx/sites-enabled 2>/dev/null || true)"
-  if [[ -n "$st_hits" ]]; then
-    local st_count
-    st_count="$(printf "%s\n" "$st_hits" | wc -l | tr -d ' ')"
-    if [[ "${st_count}" -gt 1 && -f "/etc/nginx/conf.d/00-security.conf" ]]; then
-      cp -a "/etc/nginx/conf.d/00-security.conf" "/etc/nginx/conf.d/00-security.conf.bak.$(date +%s)" || true
-      sed -i '/^[[:space:]]*server_tokens[[:space:]]/d' "/etc/nginx/conf.d/00-security.conf" || true
-    fi
-  fi
-
-  mkdir -p /etc/nginx/snippets
-
-  write_file "/etc/nginx/snippets/dlh-block-sensitive.conf" \
-"location ~* /\\.((?!well-known).)* { deny all; }
-location ~* /(\\.git|\\.svn|\\.hg|\\.env) { deny all; }
-location ~* /(composer\\.(json|lock)|package\\.json|yarn\\.lock) { deny all; }
-"
-
-  write_file "/etc/nginx/snippets/dlh-basic-antibot.conf" \
-"limit_conn ${ZONE_CONN} 20;
-location = /xmlrpc.php { deny all; }
-location = /wp-login.php { try_files \$uri \$uri/ /index.php?\$args; }
-"
-
-    cleanup_legacy_nginx_confs
-
-  # rate limit zones + UA block
-  write_file "/etc/nginx/conf.d/10-dlh-limit-zones.conf" \
-"limit_req_zone \$binary_remote_addr zone=dlh_perip:10m rate=5r/s;
-limit_req_zone \$binary_remote_addr zone=dlh_login:10m rate=1r/s;
-limit_conn_zone \$binary_remote_addr zone=${ZONE_CONN}:10m;
-"
-
-  write_file "/etc/nginx/conf.d/00-dlh-security.conf" \
-"server_tokens off;
-map \$http_user_agent \$bad_ua {
-  default 0;
-  ~*\"(masscan|nikto|sqlmap|nmap|acunetix|wpscan|python-requests)\" 1;
-}
-"
-
-  # gzip (only if not already enabled elsewhere)
-  local hits=""
-  hits="$(grep -RIn "^\s*gzip\s\+on\s*;" /etc/nginx/nginx.conf /etc/nginx/conf.d /etc/nginx/sites-enabled 2>/dev/null | grep -v "/etc/nginx/conf.d/01-dlh-gzip.conf" || true)"
-  if [[ -z "$hits" ]]; then
-    write_file "/etc/nginx/conf.d/01-dlh-gzip.conf" \
-"gzip on;
-gzip_vary on;
-gzip_proxied any;
-gzip_comp_level 5;
-gzip_min_length 1024;
-gzip_types
-  text/plain
-  text/css
-  application/json
-  application/javascript
-  application/xml
-  image/svg+xml
-  font/ttf
-  font/otf
-  font/woff
-  font/woff2;
-"
-  fi
-
-  nginx -t
-  systemctl reload nginx
-}
-
-write_default_site() {
-  mkdir -p "${DEFAULT_ROOT_BASE}/site/public"
-  [[ -f "${DEFAULT_ROOT_BASE}/site/public/index.php" ]] || write_file "${DEFAULT_ROOT_BASE}/site/public/index.php" "<?php echo 'OK';"
-  chown -R www-data:www-data "${DEFAULT_ROOT_BASE}/site"
-
-  write_file "/etc/nginx/sites-available/site" \
-"server {
-  listen 80 default_server;
-  listen [::]:80 default_server;
-  server_name _;
-  root ${DEFAULT_ROOT_BASE}/site/public;
-  index index.php index.html;
-
-  include /etc/nginx/snippets/dlh-block-sensitive.conf;
-  include /etc/nginx/snippets/dlh-basic-antibot.conf;
-
-  location / { try_files \$uri \$uri/ /index.php?\$args; }
-
-  location ~ \\.php$ {
-    include snippets/fastcgi-php.conf;
-    fastcgi_pass unix:/run/php/php8.3-fpm.sock;
-  }
-}
-"
-  rm -f /etc/nginx/sites-enabled/default || true
-  ln -sf /etc/nginx/sites-available/site /etc/nginx/sites-enabled/site
-  nginx -t
-  systemctl reload nginx
-}
-
-ensure_logrotate_nginx() {
-  write_file "/etc/logrotate.d/nginx-custom" \
-"/var/log/nginx/*.log {
-  daily
-  rotate 14
-  missingok
-  notifempty
-  compress
-  delaycompress
-  sharedscripts
-  create 0640 www-data adm
-  postrotate
-    systemctl reload nginx > /dev/null 2>&1 || true
-  endscript
-}
-"
-}
-
-ensure_dlh_dirs() {
-  mkdir -p /var/lib/dlh/secrets /var/lib/dlh
-  chmod 700 /var/lib/dlh/secrets || true
-  if [[ ! -f /var/lib/dlh/manifest.json ]]; then
-    printf '{"sites":[]}\n' > /var/lib/dlh/manifest.json
-  fi
-}
-
-main() {
-  need_root
-  ensure_apt_ipv4
-  save_conf
-
-  echo "[1/8] Base hardening"
-  apt_install software-properties-common
-  ensure_ufw
-  ensure_fail2ban
-  ensure_swap_2g
-
-  echo "[2/8] Nginx + PHP"
-  ensure_nginx_php
-
-  echo "[3/8] Nginx basics"
-  write_nginx_basics
-
-  echo "[4/8] Default site (no domain)"
-  write_default_site
-
-  echo "[5/8] Logrotate"
-  ensure_logrotate_nginx
-
-  echo "[6/8] DLH runtime dirs"
-  ensure_dlh_dirs
-
-  echo "[7/8] Install menu (dlh) from repo"
-  install_menu_from_repo
-
-  echo "[8/8] Install updater"
-  install_update_cmd
-
-  echo "DONE ✅"
-  echo "- Run menu: dlh"
-  echo "- Update later: sudo dlh-update"
-  echo "- Default webroot base: ${DEFAULT_ROOT_BASE}"
-}
-
-main
+main "$@"
