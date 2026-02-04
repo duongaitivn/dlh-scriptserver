@@ -230,8 +230,8 @@ gzip_types
 }
 
 write_default_site() {
-  mkdir -p "${DEFAULT_ROOT_BASE}/site/public"
-  [[ -f "${DEFAULT_ROOT_BASE}/site/public/index.php" ]] || write_file "${DEFAULT_ROOT_BASE}/site/public/index.php" "<?php echo 'OK';"
+  mkdir -p "${DEFAULT_ROOT_BASE}/site/public_html"
+  [[ -f "${DEFAULT_ROOT_BASE}/site/public_html/index.php" ]] || write_file "${DEFAULT_ROOT_BASE}/site/public_html/index.php" "<?php echo 'OK';"
   chown -R www-data:www-data "${DEFAULT_ROOT_BASE}/site"
 
   write_file "/etc/nginx/sites-available/site" \
@@ -239,7 +239,7 @@ write_default_site() {
   listen 80 default_server;
   listen [::]:80 default_server;
   server_name _;
-  root ${DEFAULT_ROOT_BASE}/site/public;
+  root ${DEFAULT_ROOT_BASE}/site/public_html;
   index index.php index.html;
 
   include /etc/nginx/snippets/dlh-block-sensitive.conf;
@@ -300,6 +300,7 @@ main() {
   ensure_nginx_php
 
   echo "[3/8] Nginx basics"
+  fix_legacy_nginx_zones_
   write_nginx_basics
 
   echo "[4/8] Default site (no domain)"
@@ -321,6 +322,24 @@ main() {
   echo "- Run menu: dlh"
   echo "- Update later: sudo dlh-update"
   echo "- Default webroot base: ${DEFAULT_ROOT_BASE}"
+}
+
+fix_legacy_nginx_zones_() {
+  # Dọn các file cũ gây lỗi trùng/zone perip/login
+  if [[ -f /etc/nginx/conf.d/10-limit-zones.conf && ! -f /etc/nginx/conf.d/10-limit-zones.conf.bak ]]; then
+    mv /etc/nginx/conf.d/10-limit-zones.conf /etc/nginx/conf.d/10-limit-zones.conf.bak.$(date +%s) || true
+  fi
+
+  if [[ -f /etc/nginx/snippets/basic-antibot.conf && ! -f /etc/nginx/snippets/basic-antibot.conf.bak ]]; then
+    mv /etc/nginx/snippets/basic-antibot.conf /etc/nginx/snippets/basic-antibot.conf.bak.$(date +%s) || true
+  fi
+
+  # Thay zone cũ trong các file include (nếu còn)
+  sed -i \
+    -e 's/zone=perip/zone=dlh_perip/g' \
+    -e 's/zone=login/zone=dlh_login/g' \
+    -e 's/limit_conn_zone[[:space:]]\+\$binary_remote_addr[[:space:]]\+zone=connperip/limit_conn_zone $binary_remote_addr zone=dlh_connperip/g' \
+    /etc/nginx/snippets/*.conf /etc/nginx/sites-available/*.conf /etc/nginx/sites-enabled/*.conf 2>/dev/null || true
 }
 
 main
