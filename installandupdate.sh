@@ -141,6 +141,21 @@ ensure_nginx_php() {
 }
 
 write_nginx_basics() {
+
+  # cleanup legacy rate-limit zone definitions to avoid "already bound" errors
+  local legacy_hits=""
+  legacy_hits="$(grep -RInE 'limit_(req|conn)_zone\s+\$binary_remote_addr\s+zone=(perip|login|connperip):' /etc/nginx/conf.d 2>/dev/null || true)"
+  if [[ -n "$legacy_hits" ]]; then
+    while IFS= read -r line; do
+      local f="${line%%:*}"
+      [[ -z "$f" ]] && continue
+      [[ "$f" == "/etc/nginx/conf.d/10-dlh-limit-zones.conf" ]] && continue
+      if [[ "$f" == *.conf && -f "$f" ]]; then
+        mv -f "$f" "${f}.disabled.$(date +%s)" || true
+      fi
+    done <<< "$(printf "%s\n" "$legacy_hits")"
+  fi
+
   mkdir -p /etc/nginx/snippets
 
   write_file "/etc/nginx/snippets/dlh-block-sensitive.conf" \
@@ -157,10 +172,32 @@ location = /wp-login.php { try_files \$uri \$uri/ /index.php?\$args; }
 
   # rate limit zones + UA block
   write_file "/etc/nginx/conf.d/10-dlh-limit-zones.conf" \
-"limit_req_zone \$binary_remote_addr zone=perip:10m rate=5r/s;
-limit_req_zone \$binary_remote_addr zone=login:10m rate=1r/s;
+"limit_req_zone \$binary_remote_addr zone=dlh_perip:10m rate=5r/s;
+limit_req_zone \$binary_remote_addr zone=dlh_login:10m rate=1r/s;
 limit_conn_zone \$binary_remote_addr zone=${ZONE_CONN}:10m;
 "
+
+
+  # UA block + (optional) server_tokens (avoid duplicate directive)
+  local has_server_tokens=""
+  has_server_tokens="$(grep -RIn "^[[:space:]]*server_tokens[[:space:]]" /etc/nginx/nginx.conf /etc/nginx/conf.d /etc/nginx/sites-enabled 2>/dev/null | grep -v "/etc/nginx/conf.d/00-dlh-security.conf" || true)"
+  if [[ -z "$has_server_tokens" ]]; then
+    write_file "/etc/nginx/conf.d/00-dlh-security.conf" \
+"server_tokens off;
+map \$http_user_agent \$bad_ua {
+  default 0;
+  ~*\"(masscan|nikto|sqlmap|nmap|acunetix|wpscan|python-requests)\" 1;
+}
+"
+  else
+    write_file "/etc/nginx/conf.d/00-dlh-security.conf" \
+"map \$http_user_agent \$bad_ua {
+  default 0;
+  ~*\"(masscan|nikto|sqlmap|nmap|acunetix|wpscan|python-requests)\" 1;
+}
+"
+  fi
+
 
   write_file "/etc/nginx/conf.d/00-dlh-security.conf" \
 "server_tokens off;
