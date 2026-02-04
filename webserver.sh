@@ -1,6 +1,22 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# =========================================================
+# DLH-Script V1 — Webserver Basic Installer (Ubuntu 24.04 / 1GB RAM)
+# - Nginx + PHP-FPM 8.3
+# - UFW + Fail2ban + Swap 2G
+# - gzip (skip if already enabled) + anti-bot + rate-limit zones
+# - logrotate
+# - Installs "dlh" menu (Vietnamese UI)
+# - Installs "webserver-update" to self-update from GitHub raw URL
+#
+# NOTE:
+# - Default webroot base: /home/www
+#
+# Run:
+#   curl -fsSL <RAW>/webserver.sh | sudo INSTALL_URL="<RAW>/webserver.sh" bash
+# =========================================================
+
 CONF="/etc/webserver-installer.conf"
 INSTALL_URL="${INSTALL_URL:-}"
 ZONE_CONN="dlh_connperip"
@@ -91,7 +107,7 @@ gzip_already_enabled_elsewhere() {
   [[ -n "$hits" ]]
 }
 
-# FIX: Must NOT exit when file doesn't exist under "set -e"
+# Must NOT exit when file doesn't exist under "set -e"
 disable_our_gzip_conf() {
   if [[ -f /etc/nginx/conf.d/01-gzip.conf ]]; then
     mv /etc/nginx/conf.d/01-gzip.conf /etc/nginx/conf.d/01-gzip.conf.off
@@ -284,7 +300,7 @@ pause() { read_tty "Nhấn Enter để tiếp tục..."; }
 banner() {
   clear_screen
   printf "%s%sDLH-Script V1%s\n" "$C_BOLD" "$C_CYA" "$C_RESET"
-  printf "%sBộ công cụ webserver cơ bản (Nginx/PHP/SSL/WordPress) - Product by Duong%s\n" "$C_DIM" "$C_RESET"
+  printf "%sBộ công cụ webserver cơ bản (Nginx/PHP/SSL/WordPress)%s\n" "$C_DIM" "$C_RESET"
   hr
 }
 
@@ -356,8 +372,9 @@ rclone_remote_ready_() {
 
 gdrive_setup_() {
   ensure_rclone_ || return 1
-  msg_warn "Sẽ mở cấu hình rclone. Bạn cần đăng nhập Google Drive 1 lần để cấp quyền."
-  msg_warn "Sau khi xong, remote phải có tên: ${DLH_RCLONE_REMOTE}:"
+  msg_warn "Máy VPS là headless, bạn sẽ phải lấy token bằng máy có trình duyệt."
+  msg_warn "Làm đúng theo rclone hướng dẫn: chạy 'rclone authorize ...' trên Windows rồi paste JSON token về VPS."
+  msg_warn "Bắt đầu cấu hình rclone..."
   rclone config
   if rclone_remote_ready_; then
     msg_ok "Đã kết nối Google Drive: ${DLH_RCLONE_REMOTE}:"
@@ -648,13 +665,18 @@ install_wpcli() {
 }
 
 wp_download() {
-  local domain dir
+  local domain dir cache
   domain="$(read_tty "Nhập tên miền (phải tồn tại trong ${ROOT_BASE}/<domain>/public): ")"
   domain="${domain,,}"
   dir="${ROOT_BASE}/${domain}/public"
   [[ -d "$dir" ]] || { msg_err "Không thấy thư mục web: $dir (hãy tạo Domain trước)."; return; }
 
   install_wpcli
+
+  cache="${ROOT_BASE}/.wp-cli/cache"
+  mkdir -p "$cache"
+  mkdir -p "${ROOT_BASE}/.wp-cli"
+  chown -R www-data:www-data "${ROOT_BASE}/.wp-cli"
 
   if [[ -f "${dir}/wp-config.php" || -d "${dir}/wp-admin" ]]; then
     msg_warn "WordPress có vẻ đã tồn tại tại $dir (bỏ qua)."
@@ -663,7 +685,11 @@ wp_download() {
 
   rm -f "${dir}/index.php" 2>/dev/null || true
   chown -R www-data:www-data "$dir"
-  sudo -u www-data wp core download --path="$dir" --locale=vi --skip-content
+
+  sudo -u www-data \
+    WP_CLI_CACHE_DIR="$cache" \
+    wp core download --path="$dir" --locale=vi --skip-content
+
   msg_ok "Đã tải WordPress (tiếng Việt) vào: $dir"
 }
 
@@ -879,7 +905,8 @@ main() {
 
   echo "DONE ✅"
   echo "- Run menu: dlh"
-  echo "- Update command: sudo webserver-update"
+  echo "- Update later: sudo webserver-update"
+  echo "- Default ROOT_BASE: ${DEFAULT_ROOT_BASE}"
 }
 
 main
