@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+set -euo pipefail
+RAW="https://raw.githubusercontent.com/duongaitivn/dlh-scriptserver/main/installandupdate.sh"
+curl -fsSL "$RAW" | sudo INSTALL_URL="$RAW" bash
