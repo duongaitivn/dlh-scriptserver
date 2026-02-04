@@ -1,22 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# =========================================================
-# DLH-Script V1 — Webserver Basic Installer (Ubuntu 24.04 / 1GB RAM)
-# - Nginx + PHP-FPM 8.3
-# - UFW + Fail2ban + Swap 2G
-# - gzip (skip if already enabled) + anti-bot + rate-limit zones
-# - logrotate
-# - Installs "dlh" menu (Vietnamese UI)
-# - Installs "webserver-update" to self-update from GitHub raw URL
-#
-# NOTE:
-# - Default webroot base: /home/www   (updated from /var/www)
-#
-# Run:
-#   curl -fsSL <RAW>/webserver.sh | sudo INSTALL_URL="<RAW>/webserver.sh" bash
-# =========================================================
-
 CONF="/etc/webserver-installer.conf"
 INSTALL_URL="${INSTALL_URL:-}"
 ZONE_CONN="dlh_connperip"
@@ -895,8 +879,7 @@ main() {
 
   echo "DONE ✅"
   echo "- Run menu: dlh"
-  echo "- Update later: sudo webserver-update"
-
+  echo "- Update command: sudo webserver-update"
 }
 
 main
