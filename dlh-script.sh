@@ -1,357 +1,312 @@
+\
 #!/usr/bin/env bash
 set -euo pipefail
 
-CONF="/etc/dlh-menu.conf"
+# =========================================================
+# DLH-Script V2 — menu quản trị webserver
+# Web root: /home/www/<domain>/public_html
+# =========================================================
+
+CONF_DIR="/etc/dlh-script"
+DEFAULT_EMAIL_FILE="${CONF_DIR}/ssl_email"
+ROOT_BASE_FILE="${CONF_DIR}/root_base"
 ROOT_BASE_DEFAULT="/home/www"
-PHP_SOCK="/run/php/php8.3-fpm.sock"
-ZONE_CONN_DEFAULT="dlh_connperip"
-MYSQL_ADMIN_CNF_DEFAULT="/var/lib/dlh/secrets/mysql-admin.cnf"
 
-ensure_apt_ipv4_() {
-  mkdir -p /etc/apt/apt.conf.d
-  printf 'Acquire::ForceIPv4 "true";\n' > /etc/apt/apt.conf.d/99force-ipv4
-}
+NGINX_SITES_AVAILABLE="/etc/nginx/sites-available"
+NGINX_SITES_ENABLED="/etc/nginx/sites-enabled"
+SNIPPET_ANTIBOT="/etc/nginx/snippets/dlh-basic-antibot.conf"
 
-apt_install_() {
-  ensure_apt_ipv4_
-  apt-get update -y
-  apt-get install -y "$@"
-}
-
-is_tty() { [[ -t 1 ]]; }
-if is_tty; then
-  C_RESET=$'\033[0m'; C_BOLD=$'\033[1m'; C_DIM=$'\033[2m'
-  C_RED=$'\033[31m'; C_GRN=$'\033[32m'; C_YEL=$'\033[33m'
-  C_BLU=$'\033[34m'; C_CYA=$'\033[36m'
-else
-  C_RESET=""; C_BOLD=""; C_DIM=""; C_RED=""; C_GRN=""; C_YEL=""; C_BLU=""; C_CYA=""
-fi
-
-hr() { printf "%s\n" "------------------------------------------------------------"; }
-clear_screen() { is_tty && clear || true; }
+mkdir -p "${CONF_DIR}"
+mkdir -p "${NGINX_SITES_AVAILABLE}" "${NGINX_SITES_ENABLED}"
 
 read_tty() {
-  local prompt="$1" var=""
-  if [[ -r /dev/tty ]]; then
-    IFS= read -r -p "$prompt" var </dev/tty || true
+  local prompt="$1" default="${2:-}"
+  local ans
+  if [[ -n "$default" ]]; then
+    read -r -p "${prompt} [${default}]: " ans </dev/tty || true
+    echo "${ans:-$default}"
   else
-    IFS= read -r -p "$prompt" var || true
+    read -r -p "${prompt}" ans </dev/tty || true
+    echo "${ans}"
   fi
-  printf "%s" "$var"
 }
 
+press_enter() { read -r -p "Nhấn Enter để tiếp tục..." _ </dev/tty || true; }
 
-has_dns_record_() {
-  # usage: has_dns_record_ <fqdn>
-  local fqdn="$1"
-  # Prefer dig with public resolver to avoid local resolver quirks/caching
-  if command -v dig >/dev/null 2>&1; then
-    local out
-    out="$(dig +time=2 +tries=1 +short A "$fqdn" @1.1.1.1 2>/dev/null | head -n 1)"
-    [[ -n "$out" ]] && return 0
-    out="$(dig +time=2 +tries=1 +short AAAA "$fqdn" @1.1.1.1 2>/dev/null | head -n 1)"
-    [[ -n "$out" ]] && return 0
-    # fallback resolver
-    out="$(dig +time=2 +tries=1 +short A "$fqdn" @8.8.8.8 2>/dev/null | head -n 1)"
-    [[ -n "$out" ]] && return 0
-    out="$(dig +time=2 +tries=1 +short AAAA "$fqdn" @8.8.8.8 2>/dev/null | head -n 1)"
-    [[ -n "$out" ]] && return 0
-    return 1
+root_base_get() {
+  cat "${ROOT_BASE_FILE}" 2>/dev/null || echo "${ROOT_BASE_DEFAULT}"
+}
+
+root_base_set() {
+  local rb
+  rb="$(read_tty "Nhập thư mục web gốc" "$(root_base_get)")"
+  [[ -n "$rb" ]] || rb="${ROOT_BASE_DEFAULT}"
+  mkdir -p "$rb"
+  echo "$rb" > "${ROOT_BASE_FILE}"
+  echo "[OK] ROOT_BASE = $rb"
+}
+
+email_get() { cat "${DEFAULT_EMAIL_FILE}" 2>/dev/null || true; }
+email_set() {
+  local em
+  em="$(read_tty "Nhập email SSL mặc định" "$(email_get)")"
+  if [[ -z "$em" ]]; then
+    echo "[ERR] Email trống."
+  else
+    echo "$em" > "${DEFAULT_EMAIL_FILE}"
+    echo "[OK] Đã lưu email SSL mặc định: $em"
   fi
+}
 
-  # Fallback: getent ahosts (may be affected by local NSS, but better than nothing)
-  if command -v getent >/dev/null 2>&1; then
-    getent ahosts "$fqdn" 2>/dev/null | awk '{print $1}' | head -n 1 | grep -qE '^[0-9a-fA-F:.]+$' && return 0
+ensure_pkgs() {
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get update -y
+  apt-get install -y nginx certbot python3-certbot-nginx dnsutils || true
+}
+
+dns_has_www() {
+  local domain="$1"
+  # Use public DNS to avoid /etc/hosts / local resolver tricks
+  local out=""
+  out="$(dig +short A "www.${domain}" @1.1.1.1 2>/dev/null; dig +short AAAA "www.${domain}" @1.1.1.1 2>/dev/null; dig +short A "www.${domain}" @8.8.8.8 2>/dev/null; dig +short AAAA "www.${domain}" @8.8.8.8 2>/dev/null)"
+  [[ -n "$(echo "$out" | sed '/^\s*$/d' | head -n 1)" ]]
+}
+
+domain_exists() {
+  [[ -f "${NGINX_SITES_AVAILABLE}/${1}.conf" ]] || [[ -d "$(root_base_get)/${1}" ]]
+}
+
+list_domains() {
+  echo "---- Domain đã thêm (vhost) ----"
+  if ls -1 "${NGINX_SITES_AVAILABLE}"/*.conf >/dev/null 2>&1; then
+    ls -1 "${NGINX_SITES_AVAILABLE}"/*.conf | sed 's#.*/##' | sed 's/\.conf$//' | sort
+  else
+    echo "(chưa có)"
   fi
-  return 1
 }
 
-pause() { read_tty "Nhấn Enter để tiếp tục..."; }
-
-banner() {
-  clear_screen
-  printf "%s%sDLH-Script V1%s\n" "$C_BOLD" "$C_CYA" "$C_RESET"
-  printf "%sMenu webserver cơ bản - bản tối giản 2 file%s\n" "$C_DIM" "$C_RESET"
-  hr
-}
-msg_ok()   { printf "%s[OK]%s %s\n"   "$C_GRN" "$C_RESET" "$*"; }
-msg_warn() { printf "%s[CẢNH BÁO]%s %s\n" "$C_YEL" "$C_RESET" "$*"; }
-msg_err()  { printf "%s[LỖI]%s %s\n"  "$C_RED" "$C_RESET" "$*"; }
-
-if [[ "${EUID}" -ne 0 ]]; then
-  exec sudo -E "$0" "$@"
-fi
-
-load_conf() {
-  if [[ -f "$CONF" ]]; then
-    source "$CONF" || true
+list_ssl_domains() {
+  echo "---- Domain đang có SSL (Let's Encrypt) ----"
+  if [[ -d /etc/letsencrypt/live ]]; then
+    find /etc/letsencrypt/live -maxdepth 1 -mindepth 1 -type d -printf "%f\n" | sort || true
+  else
+    echo "(chưa có)"
   fi
-  ROOT_BASE="${ROOT_BASE:-$ROOT_BASE_DEFAULT}"
-  ZONE_CONN="${ZONE_CONN:-$ZONE_CONN_DEFAULT}"
-  SSL_EMAIL="${SSL_EMAIL:-}"
-  MYSQL_ADMIN_CNF="${MYSQL_ADMIN_CNF:-$MYSQL_ADMIN_CNF_DEFAULT}"
-}
-
-save_conf() {
-  mkdir -p "$(dirname "$CONF")"
-  cat >"$CONF" <<EOF
-ROOT_BASE="${ROOT_BASE}"
-ZONE_CONN="${ZONE_CONN}"
-SSL_EMAIL="${SSL_EMAIL}"
-MYSQL_ADMIN_CNF="${MYSQL_ADMIN_CNF}"
-EOF
-}
-
-ensure_snippets() {
-  mkdir -p /etc/nginx/snippets
-  [[ -f /etc/nginx/snippets/dlh-block-sensitive.conf ]] || cat >/etc/nginx/snippets/dlh-block-sensitive.conf <<'EOF'
-location ~* /\.((?!well-known).)* { deny all; }
-location ~* /(\.git|\.svn|\.hg|\.env) { deny all; }
-location ~* /(composer\.(json|lock)|package\.json|yarn\.lock) { deny all; }
-EOF
-
-  [[ -f /etc/nginx/snippets/dlh-basic-antibot.conf ]] || cat >/etc/nginx/snippets/dlh-basic-antibot.conf <<EOF
-limit_conn ${ZONE_CONN} 20;
-location = /xmlrpc.php { deny all; }
-location = /wp-login.php { try_files \$uri \$uri/ /index.php?\$args; }
-EOF
-}
-
-nginx_reload() { nginx -t && systemctl reload nginx; }
-
-mysql_try_socket_() { mysql -e "SELECT 1" >/dev/null 2>&1; }
-mysql_try_admin_cnf_() { [[ -f "$MYSQL_ADMIN_CNF" ]] || return 1; mysql --defaults-extra-file="$MYSQL_ADMIN_CNF" -e "SELECT 1" >/dev/null 2>&1; }
-
-mysql_ensure_admin_() {
-  mkdir -p "$(dirname "$MYSQL_ADMIN_CNF")"
-  chmod 700 "$(dirname "$MYSQL_ADMIN_CNF")" 2>/dev/null || true
-  if mysql_try_socket_ || mysql_try_admin_cnf_; then return 0; fi
-
-  msg_warn "Chưa có quyền MySQL để thao tác database."
-  msg_warn "Nhập user/pass MySQL admin (thường là root). Lưu tại: ${MYSQL_ADMIN_CNF}"
-  local u p
-  u="$(read_tty "MySQL user: ")"
-  p="$(read_tty "MySQL password: ")"
-  [[ -n "$u" ]] || { msg_err "User trống."; return 1; }
-
-  cat >"$MYSQL_ADMIN_CNF" <<EOF
-[client]
-user=${u}
-password=${p}
-EOF
-  chmod 600 "$MYSQL_ADMIN_CNF"
-  mysql_try_admin_cnf_ && { msg_ok "Đã lưu MySQL admin creds."; return 0; }
-  rm -f "$MYSQL_ADMIN_CNF" || true
-  msg_err "Sai user/password MySQL."
-  return 1
-}
-
-mysql_exec_() {
-  local sql="$1"
-  if mysql_try_socket_ ; then mysql -e "$sql"; return 0; fi
-  mysql_ensure_admin_ || return 1
-  mysql --defaults-extra-file="$MYSQL_ADMIN_CNF" -e "$sql"
-}
-
-set_ssl_email() {
-  local e
-  e="$(read_tty "Nhập email mặc định (dùng cho SSL Let's Encrypt): ")"
-  [[ -n "$e" ]] || { msg_err "Email trống."; return; }
-  SSL_EMAIL="$e"
-  save_conf
-  msg_ok "Đã lưu email SSL mặc định: $SSL_EMAIL"
 }
 
 add_domain() {
-  ensure_snippets
-  local domain
-  domain="$(read_tty "Nhập tên miền (vd: example.com): ")"
-  domain="${domain,,}"
-  [[ -n "$domain" ]] || { msg_err "Tên miền trống."; return; }
+  local domain rb site_dir
+  rb="$(root_base_get)"
+  domain="$(read_tty "Nhập tên miền (vd: example.com): " "")"
+  [[ -n "$domain" ]] || { echo "[HỦY]"; return; }
 
-  local webroot="${ROOT_BASE}/${domain}/public"
-  mkdir -p "$webroot"
-  [[ -f "${webroot}/index.php" ]] || echo '<?php echo "OK"; ?>' > "${webroot}/index.php"
-  chown -R www-data:www-data "${ROOT_BASE}/${domain}"
+  if domain_exists "$domain"; then
+    echo "[CẢNH BÁO] Domain đã tồn tại: $domain"
+    return
+  fi
 
-  local conf="/etc/nginx/sites-available/${domain}.conf"
-  cat >"$conf" <<EOF
+  site_dir="${rb}/${domain}/public_html"
+  mkdir -p "${site_dir}"
+  chown -R www-data:www-data "${rb}/${domain}" || true
+
+  # Default vhost HTTP
+  cat > "${NGINX_SITES_AVAILABLE}/${domain}.conf" <<EOF
 server {
   listen 80;
   listen [::]:80;
-  server_name ${domain} www.${domain};
+  server_name ${domain};
 
-  root ${webroot};
+  root ${site_dir};
   index index.php index.html;
 
-  include /etc/nginx/snippets/dlh-block-sensitive.conf;
-  include /etc/nginx/snippets/dlh-basic-antibot.conf;
+  include ${SNIPPET_ANTIBOT};
 
-  location / { try_files \$uri \$uri/ /index.php?\$args; }
+  location / {
+    try_files \$uri \$uri/ /index.php?\$args;
+  }
 
   location ~ \.php$ {
     include snippets/fastcgi-php.conf;
-    fastcgi_pass unix:${PHP_SOCK};
+    fastcgi_pass unix:/run/php/php-fpm.sock;
+  }
+
+  location ~* \.(jpg|jpeg|png|gif|css|js|svg|ico|woff2?)$ {
+    expires 30d;
+    access_log off;
   }
 }
 EOF
 
-  ln -sf "$conf" "/etc/nginx/sites-enabled/${domain}.conf"
-  nginx_reload
-  msg_ok "Đã tạo website: ${domain}"
-  msg_ok "Webroot: ${webroot}"
+  # Resolve php-fpm socket (best effort)
+  local sock
+  sock="$(ls /run/php/php*-fpm.sock 2>/dev/null | head -n 1 || true)"
+  if [[ -n "$sock" ]]; then
+    sed -i "s#fastcgi_pass unix:/run/php/php-fpm.sock;#fastcgi_pass unix:${sock};#g" "${NGINX_SITES_AVAILABLE}/${domain}.conf"
+  fi
+
+  ln -s "${NGINX_SITES_AVAILABLE}/${domain}.conf" "${NGINX_SITES_ENABLED}/${domain}.conf" 2>/dev/null || true
+
+  nginx -t
+  systemctl reload nginx
+  echo "[OK] Đã thêm domain + vhost: ${domain}"
+  echo "[OK] Webroot: ${site_dir}"
+}
+
+pick_domain_for_ssl() {
+  local domain
+  echo
+  list_domains
+  echo
+  domain="$(read_tty "Cài SSL cho domain nào (nhập số hoặc gõ domain, Enter để hủy): " "")"
+  echo "$domain"
 }
 
 install_ssl() {
-  # SSL: auto www check
-  local domain email
-  domain="$(read_tty "Nhập tên miền để cài SSL (vd: example.com): ")"
-  domain="${domain,,}"
-  [[ -n "$domain" ]] || { msg_err "Tên miền trống."; return; }
+  ensure_pkgs
 
-  if [[ -n "${SSL_EMAIL:-}" ]]; then
-    email="$SSL_EMAIL"
-    msg_ok "Dùng email SSL mặc định: ${email}"
+  local domain email rb want_www
+  domain="$(read_tty "Nhập tên miền để cài SSL (vd: example.com): " "")"
+  [[ -n "$domain" ]] || { echo "[HỦY]"; return; }
+
+  # If user types number, map to list
+  if [[ "$domain" =~ ^[0-9]+$ ]]; then
+    local idx="$domain" i=0
+    domain=""
+    while IFS= read -r d; do
+      i=$((i+1))
+      if [[ "$i" -eq "$idx" ]]; then domain="$d"; break; fi
+    done < <(ls -1 "${NGINX_SITES_AVAILABLE}"/*.conf 2>/dev/null | sed 's#.*/##' | sed 's/\.conf$//' | sort)
+    [[ -n "$domain" ]] || { echo "[ERR] Số không hợp lệ."; return; }
+  fi
+
+  email="$(email_get)"
+  if [[ -z "$email" ]]; then
+    email="$(read_tty "Nhập email SSL (Let's Encrypt): " "")"
+    [[ -n "$email" ]] || { echo "[ERR] Cần email để xin SSL."; return; }
+    echo "$email" > "${DEFAULT_EMAIL_FILE}"
+    echo "[OK] Đã lưu email SSL mặc định: $email"
   else
-    email="$(read_tty "Nhập email nhận thông báo SSL (lưu lại lần sau): ")"
-    [[ -n "$email" ]] || { msg_err "Email trống."; return; }
-    SSL_EMAIL="$email"
-    save_conf
-    msg_ok "Đã lưu email SSL mặc định."
+    echo "[OK] Dùng email SSL mặc định: $email"
   fi
 
-  apt_install_ certbot python3-certbot-nginx
+  local domains_args
+  domains_args=(-d "$domain")
 
-  local args=(-d "$domain")
-  if getent ahosts "www.${domain}" >/dev/null 2>&1; then
-    args+=(-d "www.${domain}")
-      else
-    msg_warn "DNS thiếu www.${domain} -> bỏ www"
+  # AUTO bỏ www nếu DNS thiếu (chuẩn). Nếu có www thì thêm luôn.
+  if dns_has_www "$domain"; then
+    echo "[OK] DNS có www.${domain} -> xin SSL kèm www"
+    domains_args+=(-d "www.${domain}")
+  else
+    echo "[OK] DNS KHÔNG có www.${domain} -> bỏ www"
   fi
 
-  certbot --nginx "${args[@]}" --cert-name "$domain" --expand     -m "$email" --agree-tos --non-interactive --redirect
+  # Ensure vhost exists
+  if [[ ! -f "${NGINX_SITES_ENABLED}/${domain}.conf" ]] && [[ -f "${NGINX_SITES_AVAILABLE}/${domain}.conf" ]]; then
+    ln -s "${NGINX_SITES_AVAILABLE}/${domain}.conf" "${NGINX_SITES_ENABLED}/${domain}.conf" 2>/dev/null || true
+  fi
 
-  systemctl enable --now certbot.timer || true
-  sed -i 's/listen 443 ssl;/listen 443 ssl http2;/' /etc/nginx/sites-enabled/*.conf 2>/dev/null || true
-  sed -i 's/listen \[::\]:443 ssl;/listen [::]:443 ssl http2;/' /etc/nginx/sites-enabled/*.conf 2>/dev/null || true
-  nginx_reload
-  msg_ok "SSL OK: https://${domain}"
+  nginx -t
+
+  # Non-interactive + auto expand to avoid certbot prompt
+  certbot --nginx \
+    --non-interactive --agree-tos --email "$email" \
+    --expand --redirect --hsts --staple-ocsp \
+    "${domains_args[@]}"
+
+  systemctl reload nginx
+  echo "[OK] Đã cài SSL cho: ${domains_args[*]}"
 }
 
 delete_domain() {
-  local domain ans
-  domain="$(read_tty "Nhập tên miền cần XÓA (vd: example.com): ")"
-  domain="${domain,,}"
-  [[ -n "$domain" ]] || { msg_err "Tên miền trống."; return; }
+  local domain rb dbname
+  rb="$(root_base_get)"
+  domain="$(read_tty "Nhập domain cần XÓA (vd: example.com): " "")"
+  [[ -n "$domain" ]] || { echo "[HỦY]"; return; }
 
-  msg_warn "Sẽ xóa vhost + webroot (tuỳ chọn SSL/DB)."
-  ans="$(read_tty "Xác nhận xóa ${domain}? (gõ YES để tiếp tục): ")"
-  [[ "$ans" == "YES" ]] || { msg_warn "Hủy."; return; }
+  echo "[CẢNH BÁO] Sẽ xóa vhost + thư mục web + (tuỳ chọn) database."
+  local ok
+  ok="$(read_tty "Gõ YES để xác nhận: " "")"
+  [[ "$ok" == "YES" ]] || { echo "[HỦY]"; return; }
 
-  rm -f "/etc/nginx/sites-enabled/${domain}.conf" 2>/dev/null || true
-  rm -f "/etc/nginx/sites-available/${domain}.conf" 2>/dev/null || true
-  rm -rf "${ROOT_BASE}/${domain}" 2>/dev/null || true
-  nginx -t >/dev/null 2>&1 && systemctl reload nginx || true
+  rm -f "${NGINX_SITES_ENABLED}/${domain}.conf" || true
+  rm -f "${NGINX_SITES_AVAILABLE}/${domain}.conf" || true
 
-  ans="$(read_tty "Xóa SSL certificate của ${domain}? (y/N): ")"
-  if [[ "$ans" =~ ^[Yy]$ ]] && command -v certbot >/dev/null 2>&1; then
-    certbot delete --cert-name "$domain" --non-interactive >/dev/null 2>&1 || true
-    msg_ok "Đã xóa cert (nếu có)."
+  # Remove site directory
+  rm -rf "${rb}/${domain}" || true
+
+  # Remove cert if exists (best-effort)
+  if [[ -d "/etc/letsencrypt/live/${domain}" ]]; then
+    certbot delete --cert-name "${domain}" --non-interactive || true
   fi
 
-  ans="$(read_tty "Xóa DATABASE? (y/N): ")"
-  if [[ "$ans" =~ ^[Yy]$ ]]; then
-    local db
-    db="$(read_tty "Nhập tên database cần xóa: ")"
-    [[ -n "$db" ]] && mysql_exec_ "DROP DATABASE IF EXISTS \`${db}\`;" && msg_ok "Đã xóa DB: $db" || true
+  # Optional DB drop
+  dbname="$(read_tty "Nhập tên database để xóa (Enter bỏ qua): " "")"
+  if [[ -n "$dbname" ]]; then
+    if command -v mysql >/dev/null 2>&1; then
+      mysql -e "DROP DATABASE IF EXISTS \`${dbname}\`;" || true
+      echo "[OK] Đã xóa DB: $dbname (nếu tồn tại)"
+    else
+      echo "[WARN] Không có mysql client trên máy."
+    fi
   fi
 
-  msg_ok "Đã xóa domain: $domain"
+  nginx -t
+  systemctl reload nginx
+  echo "[OK] Đã xóa domain: $domain"
 }
 
 nginx_tools() {
-  banner
-  echo "${C_BOLD}nginx -t${C_RESET}"
-  nginx -t || true
-  echo
-  echo "${C_BOLD}Trạng thái nginx/php-fpm${C_RESET}"
-  systemctl status nginx php8.3-fpm --no-pager || true
-  hr
-  pause
-}
-
-set_root_base() {
-  local v
-  v="$(read_tty "ROOT_BASE (hiện tại: ${ROOT_BASE}): ")"
-  [[ -n "$v" ]] && ROOT_BASE="$v"
-  save_conf
-  msg_ok "ROOT_BASE=${ROOT_BASE}"
-}
-
-run_update() {
-  if command -v webserver-update >/dev/null 2>&1; then
-    webserver-update
-    msg_ok "Đã update."
-  else
-    msg_err "Chưa có webserver-update."
-  fi
-}
-
-menu_domain_ssl() {
-  while true; do
-    banner
-    printf "%s%s[TÊN MIỀN / SSL]%s\n" "$C_BOLD" "$C_BLU" "$C_RESET"
-    echo "1) Thêm tên miền"
-    echo "2) Cài SSL"
-    echo "3) Xóa tên miền"
-    echo "4) Thiết lập email SSL mặc định"
-    echo "0) Quay lại"
-    hr
-    case "$(read_tty "Chọn: ")" in
-      1) add_domain; pause ;;
-      2) install_ssl; pause ;;
-      3) delete_domain; pause ;;
-      4) set_ssl_email; pause ;;
-      0) return ;;
-      *) msg_warn "Sai lựa chọn."; pause ;;
-    esac
-  done
-}
-
-menu_system() {
-  while true; do
-    banner
-    printf "%s%s[HỆ THỐNG / CÔNG CỤ]%s\n" "$C_BOLD" "$C_BLU" "$C_RESET"
-    echo "1) Công cụ Nginx"
-    echo "2) Update script từ GitHub"
-    echo "3) Đổi ROOT_BASE"
-    echo "0) Quay lại"
-    hr
-    case "$(read_tty "Chọn: ")" in
-      1) nginx_tools ;;
-      2) run_update; pause ;;
-      3) set_root_base; pause ;;
-      0) return ;;
-      *) msg_warn "Sai lựa chọn."; pause ;;
-    esac
-  done
+  echo "1) nginx -t"
+  echo "2) systemctl status nginx"
+  echo "3) Reload nginx"
+  echo "0) Quay lại"
+  local c
+  c="$(read_tty "Chọn: " "")"
+  case "$c" in
+    1) nginx -t; press_enter;;
+    2) systemctl status nginx --no-pager; press_enter;;
+    3) systemctl reload nginx; echo "[OK] Reloaded"; press_enter;;
+    *) ;;
+  esac
 }
 
 main_menu() {
   while true; do
-    banner
-    echo "1) Tên miền / SSL"
-    echo "2) Hệ thống / Công cụ"
+    clear || true
+    echo "DLH-Script V2"
+    echo "Menu webserver cơ bản (Nginx/PHP/SSL) — /home/www/<domain>/public_html"
+    echo "------------------------------------------------------------"
+    echo "[TÊN MIỀN / SSL]"
+    echo "1) Thêm tên miền (tạo vhost + thư mục web)"
+    echo "2) Cài SSL (Let's Encrypt — tự bỏ www nếu DNS thiếu)"
+    echo "3) Xóa tên miền (+ thư mục web + tùy chọn DB)"
+    echo "4) Thiết lập email SSL mặc định"
+    echo "5) Danh sách domain đã thêm"
+    echo "6) Danh sách domain đang dùng SSL"
+    echo
+    echo "[HỆ THỐNG / CÔNG CỤ]"
+    echo "7) Công cụ Nginx (test/status/reload)"
+    echo "8) Đổi ROOT_BASE (mặc định /home/www)"
+    echo
+    echo "9) Cập nhật script (dlh-update)"
     echo "0) Thoát"
-    hr
-    case "$(read_tty "Chọn: ")" in
-      1) menu_domain_ssl ;;
-      2) menu_system ;;
-      0) exit 0 ;;
-      *) msg_warn "Sai lựa chọn."; pause ;;
+    echo "------------------------------------------------------------"
+    local c
+    c="$(read_tty "Chọn: " "")"
+    case "$c" in
+      1) add_domain; press_enter;;
+      2) install_ssl; press_enter;;
+      3) delete_domain; press_enter;;
+      4) email_set; press_enter;;
+      5) list_domains; press_enter;;
+      6) list_ssl_domains; press_enter;;
+      7) nginx_tools;;
+      8) root_base_set; press_enter;;
+      9) dlh-update || true; press_enter;;
+      0) exit 0;;
+      *) ;;
     esac
   done
 }
 
-load_conf
 main_menu
