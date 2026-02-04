@@ -1,22 +1,5 @@
 #!/usr/bin/env bash
 set -euo pipefail
-
-# =========================================================
-# DLH-Script V1 — Webserver Basic Installer (Ubuntu 24.04 / 1GB RAM)
-# - Nginx + PHP-FPM 8.3
-# - UFW + Fail2ban + Swap 2G
-# - gzip (skip if already enabled) + anti-bot + rate-limit zones
-# - logrotate
-# - Installs "dlh" menu (Vietnamese UI)
-# - Installs "webserver-update" to self-update from GitHub raw URL
-#
-# NOTE:
-# - Default webroot base: /home/www
-#
-# Run:
-#   curl -fsSL <RAW>/webserver.sh | sudo INSTALL_URL="<RAW>/webserver.sh" bash
-# =========================================================
-
 CONF="/etc/webserver-installer.conf"
 INSTALL_URL="${INSTALL_URL:-}"
 ZONE_CONN="dlh_connperip"
@@ -24,8 +7,14 @@ DEFAULT_ROOT_BASE="/home/www"
 
 need_root() { [[ "${EUID}" -eq 0 ]] || { echo "ERROR: run with sudo"; exit 1; }; }
 
+ensure_apt_ipv4() {
+  mkdir -p /etc/apt/apt.conf.d
+  printf 'Acquire::ForceIPv4 "true";\n' > /etc/apt/apt.conf.d/99force-ipv4
+}
+
 apt_install() {
   export DEBIAN_FRONTEND=noninteractive
+  ensure_apt_ipv4
   apt-get update -y
   apt-get install -y "$@"
 }
@@ -265,11 +254,24 @@ DLH_SECRETS_DIR="${DLH_SECRETS_DIR:-/var/lib/dlh/secrets}"
 DLH_RCLONE_REMOTE="${DLH_RCLONE_REMOTE:-gdrive}"
 DLH_GDRIVE_PATH="${DLH_GDRIVE_PATH:-DLH-Script/Backups}"
 
-# Store one-time SSL email here
 SSL_EMAIL_DEFAULT="${SSL_EMAIL_DEFAULT:-}"
-
-# Optional MySQL admin creds storage (for dropping DB)
 MYSQL_ADMIN_CNF="${MYSQL_ADMIN_CNF:-/var/lib/dlh/secrets/mysql-admin.cnf}"
+
+ensure_apt_ipv4_() {
+  mkdir -p /etc/apt/apt.conf.d
+  printf 'Acquire::ForceIPv4 "true";\n' > /etc/apt/apt.conf.d/99force-ipv4
+}
+
+apt_update_() {
+  ensure_apt_ipv4_
+  apt-get update -y
+}
+
+apt_install_() {
+  ensure_apt_ipv4_
+  apt-get update -y
+  apt-get install -y "$@"
+}
 
 is_tty() { [[ -t 1 ]]; }
 if is_tty; then
@@ -352,26 +354,14 @@ location = /wp-login.php { try_files \$uri \$uri/ /index.php?\$args; }
 EOF
 }
 
-# ---------- MySQL helpers (for drop DB) ----------
-mysql_try_socket_() {
-  mysql -e "SELECT 1" >/dev/null 2>&1
-}
-
-mysql_try_admin_cnf_() {
-  [[ -f "$MYSQL_ADMIN_CNF" ]] || return 1
-  mysql --defaults-extra-file="$MYSQL_ADMIN_CNF" -e "SELECT 1" >/dev/null 2>&1
-}
+mysql_try_socket_() { mysql -e "SELECT 1" >/dev/null 2>&1; }
+mysql_try_admin_cnf_() { [[ -f "$MYSQL_ADMIN_CNF" ]] || return 1; mysql --defaults-extra-file="$MYSQL_ADMIN_CNF" -e "SELECT 1" >/dev/null 2>&1; }
 
 mysql_ensure_admin_() {
   mkdir -p "$(dirname "$MYSQL_ADMIN_CNF")"
   chmod 700 "$(dirname "$MYSQL_ADMIN_CNF")" 2>/dev/null || true
 
-  if mysql_try_socket_; then
-    return 0
-  fi
-  if mysql_try_admin_cnf_; then
-    return 0
-  fi
+  if mysql_try_socket_ || mysql_try_admin_cnf_; then return 0; fi
 
   msg_warn "Chưa có quyền MySQL để thao tác database."
   msg_warn "Nhập user/pass MySQL admin (thường là root). Thông tin sẽ lưu vào ${MYSQL_ADMIN_CNF}."
@@ -399,15 +389,11 @@ EOF
 
 mysql_exec_() {
   local sql="$1"
-  if mysql_try_socket_; then
-    mysql -e "$sql"
-    return 0
-  fi
+  if mysql_try_socket_; then mysql -e "$sql"; return 0; fi
   mysql_ensure_admin_ || return 1
   mysql --defaults-extra-file="$MYSQL_ADMIN_CNF" -e "$sql"
 }
 
-# ---------- Actions ----------
 add_domain() {
   ensure_snippets
   local domain
@@ -463,7 +449,6 @@ install_ssl() {
   domain="${domain,,}"
   [[ -n "$domain" ]] || { msg_err "Tên miền trống."; return; }
 
-  # email: use stored default; if empty -> ask once and save
   if [[ -n "${SSL_EMAIL:-}" ]]; then
     email="$SSL_EMAIL"
     msg_ok "Dùng email SSL mặc định: ${email}"
@@ -475,8 +460,7 @@ install_ssl() {
     msg_ok "Đã lưu email SSL mặc định."
   fi
 
-  apt-get update -y
-  apt-get install -y certbot python3-certbot-nginx
+  apt_install_ certbot python3-certbot-nginx
 
   local args=(-d "$domain")
   if getent ahosts "www.${domain}" >/dev/null 2>&1; then
@@ -560,8 +544,7 @@ install_wpcli() {
     msg_ok "WP-CLI đã có sẵn: $(wp --version)"
     return
   fi
-  apt-get update -y
-  apt-get install -y curl php-cli
+  apt_install_ curl php-cli
   curl -fsSL https://raw.githubusercontent.com/wp-cli/builds/gh-pages/phar/wp-cli.phar -o /tmp/wp-cli.phar
   php /tmp/wp-cli.phar --info >/dev/null
   chmod +x /tmp/wp-cli.phar
@@ -630,23 +613,6 @@ wp_menu() {
   done
 }
 
-# Backup menu kept (V2 stub/feature set already in your build)
-ensure_tools_backup_() { apt-get update -y && apt-get install -y tar gzip coreutils findutils jq mariadb-client >/dev/null 2>&1 || true; }
-ensure_rclone_() { command -v rclone >/dev/null 2>&1 && return 0; apt-get update -y; apt-get install -y rclone >/dev/null 2>&1 || return 1; }
-rclone_remote_ready_() { command -v rclone >/dev/null 2>&1 || return 1; rclone listremotes 2>/dev/null | grep -qx "${DLH_RCLONE_REMOTE}:"; }
-gdrive_setup_() { ensure_rclone_ || { msg_err "Không cài được rclone."; return 1; } ; msg_warn "Máy VPS là headless. Làm theo rclone config để lấy token."; rclone config; }
-
-manifest_exists_() { [[ -f "$DLH_MANIFEST" ]] && [[ -s "$DLH_MANIFEST" ]]; }
-list_domains_from_manifest_() { jq -r '.sites[]?.domain // empty' "$DLH_MANIFEST" 2>/dev/null; }
-get_site_json_() { local domain="$1"; jq -c --arg d "$domain" '.sites[]? | select(.domain==$d)' "$DLH_MANIFEST" 2>/dev/null || true; }
-safe_domain_() { local d="$1"; echo "$d" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9\.\-]//g'; }
-backup_prune_local_() { local domain="$1" keep="${2:-$DLH_KEEP_BACKUPS}" d base to_delete; d="$(safe_domain_ "$domain")"; base="${DLH_BACKUP_DIR}/${d}"; [[ -d "$base" ]] || return 0; to_delete="$(ls -1dt "${base}/"*/ 2>/dev/null | tail -n +"$((keep+1))" || true)"; [[ -n "$to_delete" ]] && echo "$to_delete" | while IFS= read -r p; do rm -rf "$p" || true; done; }
-backup_site_local_() { msg_warn "Chức năng backup local yêu cầu manifest V2 (tên miền/webroot/db)."; }
-backup_all_local_() { msg_warn "Chức năng backup local ALL yêu cầu manifest V2."; }
-gdrive_upload_domain_() { msg_warn "Upload GDrive yêu cầu backup local + rclone remote."; }
-gdrive_upload_all_() { msg_warn "Upload GDrive ALL yêu cầu backup local + rclone remote."; }
-backup_prune_all_() { msg_warn "Dọn backup yêu cầu backup local."; }
-
 menu_backup() {
   while true; do
     banner
@@ -660,14 +626,9 @@ menu_backup() {
     echo "0) Quay lại"
     hr
     case "$(read_tty "Chọn: ")" in
-      1) backup_site_local_ "x"; pause ;;
-      2) backup_all_local_; pause ;;
-      3) gdrive_upload_domain_ "x"; pause ;;
-      4) gdrive_upload_all_; pause ;;
-      5) gdrive_setup_; pause ;;
-      6) backup_prune_all_; pause ;;
+      5) apt_install_ rclone; msg_ok "Đã cài rclone (nếu chưa có)."; rclone config; pause ;;
       0) return ;;
-      *) msg_warn "Lựa chọn không hợp lệ."; pause ;;
+      *) msg_warn "V1 chưa bật backup V2 ở menu này."; pause ;;
     esac
   done
 }
@@ -783,6 +744,7 @@ SH
 
 main() {
   need_root
+  ensure_apt_ipv4
   save_conf
 
   echo "[1/6] UFW + Fail2ban + Swap"
